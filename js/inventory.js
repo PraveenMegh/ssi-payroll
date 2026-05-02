@@ -623,10 +623,10 @@ const SSIInventory = (() => {
   // ✅ NEW FUNCTION: Update product current_stock in products table ✅
   async function updateProductStock(productId, unitId, entryType, qty, st) {
     try {
-      // Find the product in the products array
+      // Find the product in the local state
       const product = st.products.find(p => p.id === productId);
       if (!product) {
-        console.warn(`Product ${productId} not found in products table`);
+        console.warn(`Product ${productId} not found in local state products table`);
         return;
       }
 
@@ -646,22 +646,52 @@ const SSIInventory = (() => {
       // Update the product's current_stock field
       product.current_stock = Math.max(0, currentStock); // Prevent negative stock
 
-      console.log(`✅ Product stock updated: ${product.name} → ${SSIApp.qtyFmt(product.current_stock)} ${product.uom || 'KG'}`);
+      console.log(`✅ Local state updated: ${product.name} → ${SSIApp.qtyFmt(product.current_stock)} ${product.uom || 'KG'}`);
       
-      // Also update via API if you're using the RESTful API
-      if (window.API && API.patch) {
+      // ✅ CRITICAL: Also update the API products table (for Products panel)
+      if (window.API) {
         try {
-          await API.patch('products', productId, {
-            current_stock: product.current_stock
+          // First, try to get the product from API by matching name ONLY (ignoring SKU)
+          const apiProducts = await API.getAll('products');
+          
+          // Normalize product name for matching
+          const productNameLower = (product.name || '').toLowerCase().trim();
+          
+          const apiProduct = apiProducts.find(p => {
+            const apiNameLower = (p.product_name || p.name || '').toLowerCase().trim();
+            return apiNameLower === productNameLower;
           });
+
+          if (apiProduct) {
+            // Calculate the new stock for this specific unit
+            // Get current stock from API
+            const currentApiStock = parseFloat(apiProduct.current_stock || 0);
+            
+            // Calculate change: if IN, add; if OUT, subtract
+            let newStock = currentApiStock;
+            if (isIn) {
+              newStock = currentApiStock + qty;
+            } else if (isOut) {
+              newStock = Math.max(0, currentApiStock - qty);
+            }
+            
+            // Update via PATCH
+            await API.patch('products', apiProduct.id, {
+              current_stock: newStock
+            });
+            console.log(`✅ API products table updated: ${apiProduct.product_name || apiProduct.name} → ${newStock} KG (was ${currentApiStock} KG, ${isOut ? 'removed' : 'added'} ${qty} KG)`);
+          } else {
+            console.warn(`⚠️ Product not found in API products table: "${product.name}"`);
+            console.log(`Available products:`, apiProducts.map(p => p.product_name || p.name));
+          }
         } catch (apiError) {
-          console.warn('API update failed, but local state updated:', apiError);
+          console.warn('⚠️ API update failed, but local state updated:', apiError);
         }
       }
 
     } catch (error) {
       console.error('Error updating product stock:', error);
-      SSIApp.toast('⚠️ Stock updated in inventory but product table sync failed', 'warning');
+      SSIApp.toast('⚠️ Stock updated in inventory but product table sync may have failed', 'warning');
     }
   }
 
