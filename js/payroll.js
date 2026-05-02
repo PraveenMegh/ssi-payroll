@@ -251,9 +251,8 @@ function renderEmployeeTable(employees, type) {
     }
     
     displayEmployees.sort((a, b) => {
-        if (a.employee_type === 'Partner' && b.employee_type !== 'Partner') return -1;
-        if (a.employee_type !== 'Partner' && b.employee_type === 'Partner') return 1;
-        return a.emp_id.localeCompare(b.emp_id);
+        // Sort alphabetically by full_name
+        return a.full_name.localeCompare(b.full_name);
     });
     
     const user = JSON.parse(sessionStorage.getItem('currentUser'));
