@@ -299,13 +299,6 @@ const SSIAttendance = (() => {
 
     await SSIApp.saveState(st);
     overlay?.remove();
-    
-    // 🎯 AUTO-CALCULATE WAGES
-    if (window.SSIPayroll && SSIPayroll.autoRecalculateWages) {
-      await SSIPayroll.autoRecalculateWages(empId, date);
-      console.log('✅ Wages auto-calculated for', empId, date);
-    }
-    
     applyFilter();
   }
 
@@ -390,8 +383,6 @@ const SSIAttendance = (() => {
     const emps = (st.employees||[]).filter(e=>e.active!==false);
 
     let saved = 0;
-    const employeeIds = []; // Track employees for bulk wage calculation
-    
     emps.forEach(emp => {
       const empId  = emp.id;
       const selEl  = document.getElementById(`bulk-s-${empId}`);
@@ -414,20 +405,9 @@ const SSIAttendance = (() => {
       if (idx>=0) st.attendance[idx] = entry;
       else        st.attendance.push(entry);
       saved++;
-      employeeIds.push(empId);
     });
 
     await SSIApp.saveState(st);
-    
-    // 🎯 AUTO-CALCULATE WAGES FOR ALL EMPLOYEES
-    if (window.SSIPayroll && SSIPayroll.autoRecalculateWages) {
-      console.log(`🔄 Auto-calculating wages for ${employeeIds.length} employees...`);
-      for (const empId of employeeIds) {
-        await SSIPayroll.autoRecalculateWages(empId, date);
-      }
-      console.log(`✅ Bulk wage calculation completed for ${employeeIds.length} employees`);
-    }
-    
     SSIApp.toast(`✅ Attendance saved for ${saved} employees on ${date}`, 'success');
     SSIApp.closeModal();
     applyFilter();
@@ -477,7 +457,6 @@ const SSIAttendance = (() => {
       const st = SSIApp.getState();
       if (!st.attendance) st.attendance = [];
       let added=0, skipped=0;
-      const importedEmployees = new Set(); // Track unique employees for wage calculation
 
       for (let i=1; i<rows.length; i++) {
         const r      = rows[i];
@@ -505,21 +484,8 @@ const SSIAttendance = (() => {
         if (idx>=0) st.attendance[idx] = entry;
         else        st.attendance.push(entry);
         added++;
-        importedEmployees.add(`${emp.id}|${date}`); // Store emp_id + date for wage calc
       }
-      
       await SSIApp.saveState(st);
-      
-      // 🎯 AUTO-CALCULATE WAGES FOR IMPORTED EMPLOYEES
-      if (window.SSIPayroll && SSIPayroll.autoRecalculateWages && importedEmployees.size > 0) {
-        console.log(`🔄 Auto-calculating wages for ${importedEmployees.size} employee records...`);
-        for (const empDate of importedEmployees) {
-          const [empId, date] = empDate.split('|');
-          await SSIPayroll.autoRecalculateWages(empId, date);
-        }
-        console.log(`✅ Wage calculation completed for imported attendance`);
-      }
-      
       SSIApp.toast(`✅ Import done — ${added} records saved, ${skipped} skipped`);
       applyFilter();
     } catch(err) {
@@ -558,13 +524,6 @@ const SSIAttendance = (() => {
     await SSIApp.saveState(st);
     SSIApp.audit('ATTENDANCE_DELETE', `Deleted attendance: ${rec.emp_id} ${rec.date}`);
     SSIApp.toast('🗑️ Attendance record deleted');
-    
-    // 🎯 RECALCULATE WAGES AFTER DELETION
-    if (window.SSIPayroll && SSIPayroll.autoRecalculateWages) {
-      await SSIPayroll.autoRecalculateWages(rec.emp_id, rec.date);
-      console.log('✅ Wages recalculated after attendance deletion');
-    }
-    
     applyFilter();
   }
 
