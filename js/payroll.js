@@ -9,7 +9,7 @@ const DUTY_HOURS_END = '17:30';
 const DAILY_WORK_HOURS = 8.5;
 
 // Staff password (can be changed)
-const STAFF_VIEW_PASSWORD = 'your_new_password_here';
+const STAFF_VIEW_PASSWORD = 'staff@2024';
 let staffViewUnlocked = false;
 
 // Employee Management
