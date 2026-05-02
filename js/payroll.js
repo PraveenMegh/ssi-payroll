@@ -243,7 +243,14 @@ async function showStaff() {
 function renderEmployeeTable(employees, type) {
     const tbody = document.getElementById('employeeTableBody');
     
-    employees.sort((a, b) => {
+    // Filter based on password lock status
+    let displayEmployees = employees;
+    if (!staffViewUnlocked) {
+        // Only show Workers when staff view is locked
+        displayEmployees = employees.filter(emp => emp.employee_type === 'Worker');
+    }
+    
+    displayEmployees.sort((a, b) => {
         if (a.employee_type === 'Partner' && b.employee_type !== 'Partner') return -1;
         if (a.employee_type !== 'Partner' && b.employee_type === 'Partner') return 1;
         return a.emp_id.localeCompare(b.emp_id);
@@ -251,7 +258,7 @@ function renderEmployeeTable(employees, type) {
     
     const user = JSON.parse(sessionStorage.getItem('currentUser'));
     
-    tbody.innerHTML = employees.map(emp => `
+    tbody.innerHTML = displayEmployees.map(emp => `
         <tr class="border-b hover:bg-gray-50 employee-row ${emp.employee_type === 'Partner' ? 'bg-purple-50' : ''}" data-unit="${emp.unit}" data-type="${type}">
             <td class="py-3 px-4 font-bold">${emp.emp_id}</td>
             <td class="py-3 px-4">
