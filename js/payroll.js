@@ -831,11 +831,118 @@ const SSIPayroll = (() => {
     applyFilter();
   }
 
+  /* ── Auto-recalculate wages for a specific employee & month ── */
+  async function autoRecalculateWages(empId, date) {
+    const st = SSIApp.getState();
+    const emp = (st.employees || []).find(e => e.id === empId);
+    if (!emp || emp.active === false) return;
+
+    // Extract month from date (YYYY-MM format)
+    const month = date.substring(0, 7);
+    const [yr, mo] = month.split('-').map(Number);
+    const daysInMonth = new Date(yr, mo, 0).getDate();
+    
+    // Build all days in this month
+    const days = Array.from({length: daysInMonth}, (_, i) => {
+      const d = String(i + 1).padStart(2, '0');
+      return `${yr}-${String(mo).padStart(2, '0')}-${d}`;
+    });
+
+    // Get attendance for this employee for this month
+    const attRecs = (st.attendance || []).filter(a => 
+      a.emp_id === empId && a.date && a.date.startsWith(month)
+    );
+    const attMap = {};
+    attRecs.forEach(a => { attMap[a.date] = a; });
+
+    // Calculate attendance stats
+    let present = 0, half = 0, leaves = 0, absent = 0, woff = 0, otHours = 0;
+    days.forEach(d => {
+      const rec = attMap[d];
+      const s = rec?.status || 'A';
+      if (s === 'P') { 
+        present++; 
+        if (rec?.ot_hours) otHours += Number(rec.ot_hours); 
+      }
+      else if (s === 'A') absent++;
+      else if (s === 'H') { 
+        half++; 
+        if (rec?.ot_hours) otHours += Number(rec.ot_hours); 
+      }
+      else if (s === 'L') leaves++;
+      else if (s === 'WO' || s === 'HD') woff++;
+    });
+
+    // Calculate wages
+    const paidLeaves = emp.type === 'STAFF' ? Math.min(leaves, PAID_LEAVES_STAFF) : 0;
+    const effectiveDays = present + (half * 0.5) + paidLeaves;
+    const perDay = Math.round(((emp.monthly_salary || 0) / daysInMonth) * 100) / 100;
+    const otRate = Math.round(((emp.monthly_salary || 0) / daysInMonth / 8) * 100) / 100;
+    const grossBase = Math.round(perDay * effectiveDays * 100) / 100;
+    const otAmount = emp.type === 'WORKER' ? Math.round(otHours * otRate * 100) / 100 : 0;
+    const grossPay = Math.round((grossBase + otAmount) * 100) / 100;
+
+    // Get existing payroll record (preserve advances/deductions)
+    const existing = st.payroll.find(p => p.emp_id === emp.id && p.period === month);
+    
+    // Don't overwrite PAID records
+    if (existing?.status === 'PAID') return;
+
+    const advance = existing?.advance || 0;
+    const epfAmount = Math.round(grossBase * EPF_RATE * 100) / 100;
+    const esiAmount = grossPay <= ESI_LIMIT ? Math.round(grossPay * ESI_RATE * 100) / 100 : 0;
+    const totalDeduct = Math.round((advance + epfAmount + esiAmount) * 100) / 100;
+    const netPay = Math.max(0, Math.round((grossPay - totalDeduct) * 100) / 100);
+
+    // Create/update payroll record
+    const rec = {
+      id: existing?.id || SSIApp.uid(),
+      emp_id: emp.id,
+      emp_name: emp.name || '',
+      emp_code: emp.emp_code || '',
+      emp_type: emp.type || '',
+      unit_name: (st.units || []).find(u => u.id === emp.unit_id)?.name || '',
+      period: month,
+      monthly_salary: emp.monthly_salary || 0,
+      working_days: daysInMonth,
+      present_days: present,
+      half_days: half,
+      leave_days: leaves,
+      paid_leaves: paidLeaves,
+      absent_days: absent,
+      week_offs: woff,
+      ot_hours: otHours,
+      ot_rate: otRate,
+      ot_amount: otAmount,
+      gross_pay: grossPay,
+      advance: advance,
+      epf_amount: epfAmount,
+      esi_amount: esiAmount,
+      deductions: totalDeduct,
+      deduction_note: existing?.deduction_note || '',
+      net_pay: netPay,
+      status: existing?.status || 'DRAFT',
+      payment_date: existing?.payment_date || '',
+      payment_mode: existing?.payment_mode || '',
+      remarks: existing?.remarks || '',
+      generated_by: SSIApp.state.currentUser?.id || '',
+      generated_at: new Date().toISOString(),
+    };
+
+    const idx = st.payroll.findIndex(p => p.emp_id === emp.id && p.period === month);
+    if (idx >= 0) st.payroll[idx] = rec;
+    else st.payroll.push(rec);
+
+    await SSIApp.saveState(st);
+    console.log(`✅ Auto-recalculated wages for ${emp.name} (${month})`);
+  }
+
   return {
     render, refresh, applyFilter,
     openGenerateModal, runGenerate,
     openEdit, saveEdit, _calcNet, deletePayroll, markPaid,
     printSlip, exportExcel,
-    openRelinkModal, saveRelink
+    openRelinkModal, saveRelink,
+    autoRecalculateWages  // Export the new function
   };
 })();
