@@ -101,7 +101,7 @@ const SSIInventory = (() => {
               <th>Pack Mode</th><th style="text-align:right;">Qty (KG/NOS)</th>
               <th style="text-align:right;">Closing Balance</th>
               <th>Bill / Note</th><th>By</th>
-              
+              <th style="text-align:center;">Actions</th>
             </tr></thead>
             <tbody id="inv-tbody">
               ${renderRows(ledger, st)}
@@ -113,7 +113,7 @@ const SSIInventory = (() => {
   }
 
   function renderRows(ledger, st) {
-    if (!ledger.length) return `<tr><td colspan="9" style="text-align:center;padding:40px;color:#94a3b8;">No inventory entries yet. Add your first entry!</td></tr>`;
+    if (!ledger.length) return `<tr><td colspan="10" style="text-align:center;padding:40px;color:#94a3b8;">No inventory entries yet. Add your first entry!</td></tr>`;
     const typeColors     = {IN:'#dcfce7',OUT:'#fee2e2',OPENING:'#FDECEA',ADJUST:'#fef3c7',TRANSFER_OUT:'#fce7f3',TRANSFER_IN:'#ede9fe',ISSUE:'#ede9fe'};
     const typeTextColors = {IN:'#166534',OUT:'#991b1b',OPENING:'#D35400',ADJUST:'#92400e',TRANSFER_OUT:'#9d174d',TRANSFER_IN:'#5b21b6',ISSUE:'#6d28d9'};
     return ledger.map(t => {
@@ -149,7 +149,14 @@ const SSIInventory = (() => {
             : (t.note||'—')}
         </td>
         <td style="font-size:12px;color:#94a3b8;">${user?.name||t.user_name||'—'}</td>
-        
+        <td style="text-align:center;white-space:nowrap;">
+          <button onclick="SSIInventory.editEntry('${t.id}')" class="btn-icon" title="Edit Entry" style="color:#2563eb;background:none;border:none;cursor:pointer;padding:6px 10px;font-size:16px;">
+            <i class="fas fa-edit"></i>
+          </button>
+          <button onclick="SSIInventory.deleteEntry('${t.id}')" class="btn-icon" title="Delete Entry" style="color:#dc2626;background:none;border:none;cursor:pointer;padding:6px 10px;font-size:16px;">
+            <i class="fas fa-trash"></i>
+          </button>
+        </td>
       </tr>`;
     }).join('');
   }
@@ -658,6 +665,166 @@ const SSIInventory = (() => {
     }
   }
 
+  async function editEntry(id) {
+    const st = SSIApp.getState();
+    const entry = st.inventory.find(t => t.id === id);
+    if (!entry) {
+      SSIApp.toast('Entry not found', 'error');
+      return;
+    }
+
+    const prod = st.products.find(p => p.id === entry.product_id);
+    const unit = st.units.find(u => u.id === entry.unit_id);
+
+    const html = `
+      <div class="modal-header">
+        <h3 style="font-size:18px;font-weight:700;">✏️ Edit Inventory Entry</h3>
+        <button onclick="SSIApp.closeModal()" style="background:none;border:none;font-size:20px;cursor:pointer;color:#64748b;">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-grid form-grid-2" style="margin-bottom:16px;">
+          <div>
+            <label>Date *</label>
+            <input type="date" id="inv-edit-date" value="${entry.date}">
+          </div>
+          <div>
+            <label>Entry Type *</label>
+            <select id="inv-edit-type" onchange="SSIInventory._onEditTypeChange(this.value)">
+              ${ENTRY_TYPES.map(t=>`<option value="${t.value}" ${t.value===entry.type?'selected':''}>${t.label}</option>`).join('')}
+            </select>
+          </div>
+          <div>
+            <label>SSI Unit *</label>
+            <select id="inv-edit-unit" disabled style="background:#f1f5f9;">
+              <option value="${entry.unit_id}" selected>${unit?.name||'—'}</option>
+            </select>
+            <div style="font-size:11px;color:#64748b;margin-top:4px;">Cannot change unit on existing entry</div>
+          </div>
+          <div>
+            <label>Product *</label>
+            <select id="inv-edit-product" disabled style="background:#f1f5f9;">
+              <option value="${entry.product_id}" selected>${prod?.name||'—'}</option>
+            </select>
+            <div style="font-size:11px;color:#64748b;margin-top:4px;">Cannot change product on existing entry</div>
+          </div>
+        </div>
+
+        <div style="background:#fef3c7;border:1.5px solid #f59e0b;border-radius:8px;padding:12px;margin-bottom:16px;">
+          <div style="font-weight:600;color:#92400e;font-size:13px;margin-bottom:8px;">Current Quantity</div>
+          <div style="font-size:24px;font-weight:900;color:#92400e;">${SSIApp.qtyFmt(entry.qty)} ${prod?.uom||'KG'}</div>
+          <div style="font-size:11px;color:#92400e;margin-top:4px;">Edit quantity below to update</div>
+        </div>
+
+        <div style="margin-bottom:16px;">
+          <label>New Quantity (${prod?.uom||'KG'}) *</label>
+          <input type="number" id="inv-edit-qty" value="${entry.qty}" min="0.001" step="0.001" placeholder="Enter new quantity" style="font-size:18px;font-weight:700;">
+        </div>
+
+        <!-- ISSUE-specific fields (shown only when type = ISSUE) -->
+        <div id="inv-edit-issue-fields" style="display:${entry.type==='ISSUE'?'block':'none'};margin-top:16px;padding:16px;background:#f5f3ff;border:1.5px solid #c4b5fd;border-radius:10px;">
+          <div style="font-weight:700;font-size:13px;color:#6d28d9;margin-bottom:12px;">🔧 Internal Issue Details</div>
+          <div class="form-grid form-grid-2">
+            <div>
+              <label>Issued To *</label>
+              <input id="inv-edit-issued-to" value="${entry.issued_to||''}" placeholder="Employee name" style="border-color:#c4b5fd;">
+            </div>
+            <div>
+              <label>Purpose / Reason *</label>
+              <input id="inv-edit-purpose" value="${entry.purpose||''}" placeholder="e.g. Machine repair" style="border-color:#c4b5fd;">
+            </div>
+            <div>
+              <label>Department (optional)</label>
+              <input id="inv-edit-dept" value="${entry.department||''}" placeholder="e.g. Maintenance" style="border-color:#c4b5fd;">
+            </div>
+          </div>
+        </div>
+
+        <div style="margin-top:16px;">
+          <label>Bill No. / Note</label>
+          <input id="inv-edit-note" value="${entry.note||''}" placeholder="e.g. Bill No. 1234 / Truck No. UP15AB1234">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="SSIApp.closeModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="SSIInventory.saveEditEntry('${id}')">💾 Update Entry</button>
+      </div>`;
+
+    SSIApp.showModal(html);
+  }
+
+  function _onEditTypeChange(type) {
+    const issueFields = document.getElementById('inv-edit-issue-fields');
+    if (issueFields) {
+      issueFields.style.display = (type === 'ISSUE') ? 'block' : 'none';
+    }
+  }
+
+  async function saveEditEntry(id) {
+    const st = SSIApp.getState();
+    const entry = st.inventory.find(t => t.id === id);
+    if (!entry) {
+      SSIApp.toast('Entry not found', 'error');
+      return;
+    }
+
+    const date = document.getElementById('inv-edit-date')?.value;
+    const type = document.getElementById('inv-edit-type')?.value;
+    const newQty = parseFloat(document.getElementById('inv-edit-qty')?.value || 0);
+    const note = document.getElementById('inv-edit-note')?.value?.trim() || '';
+    
+    const isIssue = (type === 'ISSUE');
+    const issued_to = isIssue ? (document.getElementById('inv-edit-issued-to')?.value?.trim() || '') : '';
+    const purpose = isIssue ? (document.getElementById('inv-edit-purpose')?.value?.trim() || '') : '';
+    const dept = isIssue ? (document.getElementById('inv-edit-dept')?.value?.trim() || '') : '';
+
+    if (!date || !type) {
+      SSIApp.toast('Please fill all required fields', 'error');
+      return;
+    }
+
+    if (newQty <= 0) {
+      SSIApp.toast('Quantity must be greater than 0', 'error');
+      return;
+    }
+
+    if (isIssue && !purpose) {
+      SSIApp.toast('❌ Please enter a Purpose/Reason for the internal issue', 'error');
+      return;
+    }
+
+    // Check if quantity changed
+    const oldQty = entry.qty;
+    const qtyChanged = newQty !== oldQty;
+    const typeChanged = type !== entry.type;
+
+    if (qtyChanged || typeChanged) {
+      // First, reverse the old entry's stock impact
+      const oldIsOut = ['OUT','TRANSFER_OUT','ISSUE'].includes(entry.type);
+      const reverseType = oldIsOut ? 'IN' : 'OUT';
+      await updateProductStock(entry.product_id, entry.unit_id, reverseType, oldQty, st);
+
+      // Then apply the new entry's stock impact
+      await updateProductStock(entry.product_id, entry.unit_id, type, newQty, st);
+    }
+
+    // Update entry
+    entry.date = date;
+    entry.type = type;
+    entry.qty = newQty;
+    entry.note = note;
+    entry.issued_to = issued_to;
+    entry.purpose = purpose;
+    entry.department = dept;
+    entry.updated_at = new Date().toISOString();
+
+    await SSIApp.saveState(st);
+    const prod = st.products.find(p=>p.id===entry.product_id);
+    SSIApp.toast(`✅ Entry updated: ${SSIApp.qtyFmt(newQty)} ${prod?.uom||'KG'}`);
+    SSIApp.audit('INV_EDIT', `${type} ${newQty} ${prod?.name}`);
+    SSIApp.closeModal();
+    refresh(document.getElementById('page-area'));
+  }
+
   async function deleteEntry(id) {
     const ok = await SSIApp.confirm('Delete this inventory entry? Stock balance will change.');
     if (!ok) return;
@@ -825,9 +992,9 @@ const SSIInventory = (() => {
   }
 
   return {
-    render, refresh, applyFilter, _onTypeChange,
+    render, refresh, applyFilter, _onTypeChange, _onEditTypeChange,
     openEntryModal, onProductUnitChange, onPackModeChange, calcTotal,
-    saveEntry, deleteEntry, clearInventory,
+    saveEntry, editEntry, saveEditEntry, deleteEntry, clearInventory,
     exportExcel, downloadTemplate, importExcel,
     updateProductStock // Export for potential external use
   };
