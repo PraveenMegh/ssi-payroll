@@ -474,6 +474,8 @@ const SSIAttendance = (() => {
         const entry = {
           id:         idx>=0 ? st.attendance[idx].id : SSIApp.uid(),
           emp_id:     emp.id,
+          emp_code:   emp.emp_code,    // ✅ ADD THIS
+          emp_name:   emp.name,        // ✅ ADD THIS
           date,
           status,
           ot_hours:   (status==='P'||status==='H') ? otHours : 0,
