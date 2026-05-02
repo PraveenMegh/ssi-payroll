@@ -139,8 +139,6 @@ async function loadEmployeeManagement(content, user) {
                                 <td class="py-3 px-4">
                                     <span class="px-2 py-1 rounded-full text-xs bg-green-100 text-green-800">${emp.employee_type}</span>
                                 </td>
-                                    }">${emp.employee_type}</span>
-                                </td>
                                 <td class="py-3 px-4">${emp.designation}</td>
                                 <td class="py-3 px-4">${emp.unit}</td>
                                 <td class="py-3 px-4">${Utils.formatCurrency(emp.basic_salary, 'INR')}</td>
