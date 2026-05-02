@@ -1,841 +1,1266 @@
-/* ============================================================
-   SSI Payroll Module
-   payroll.js
-   Access: ADMIN = all (staff + workers)
-           ACCOUNTANT = workers only (staff salary hidden)
-   Formula: Net = (MonthlySalary/daysInMonth) × EffectiveDays + OT − EPF − ESI − Advance
-   OT Rate  = (MonthlySalary / daysInMonth / 8) per hour  (8-hr working day)
-   EPF      = 12% of Basic (employer contribution, deducted for display)
-   ESI      = 0.75% of Gross (employee, only if Gross ≤ ₹21,000)
-   Advance  = manual entry per payroll record
-   Staff:   up to 2 paid leaves counted as Present
-   Workers: overtime eligible, no paid leaves
-   ============================================================ */
-const SSIPayroll = (() => {
+// Payroll Management Module
 
-  const PAID_LEAVES_STAFF = 2;
-  const EPF_RATE  = 0.12;    // 12% employer EPF on basic
-  const ESI_RATE  = 0.0075;  // 0.75% employee ESI on gross
-  const ESI_LIMIT = 21000;   // ESI not applicable above ₹21,000 gross
+// Constants
+const ESI_RATE = 0.0075; // 0.75% employee contribution
+const EPF_RATE = 0.12; // 12% employee contribution
+const MONTHLY_DAYS = 30;
+const DUTY_HOURS_START = '09:00';
+const DUTY_HOURS_END = '17:30';
+const DAILY_WORK_HOURS = 8.5;
 
-  /* ── Employee lookup helper (3-tier: id → emp_code → null) ─
-     Handles the case where employees were deleted and re-imported
-     with new IDs after payroll records were already generated.  */
-  function _findEmp(st, p) {
-    const emps = st.employees || [];
-    // Tier 1: exact id match (normal case)
-    let emp = emps.find(e => e.id === p.emp_id);
-    if (emp) return emp;
-    // Tier 2: match by emp_code stored in payroll record (new records)
-    if (p.emp_code) emp = emps.find(e => e.emp_code === p.emp_code);
-    if (emp) return emp;
-    // Tier 3: match by name stored in payroll record (new records)
-    if (p.emp_name) emp = emps.find(e => e.name === p.emp_name);
-    if (emp) return emp;
-    // Tier 4: emp_id might actually be an emp_code (legacy edge case)
-    emp = emps.find(e => e.emp_code === p.emp_id);
-    return emp || null;
-  }
+// Staff password (can be changed)
+const STAFF_VIEW_PASSWORD = 'staff@2024';
+let staffViewUnlocked = false;
 
-  /* ── Auto-repair broken payroll → employee links ────────────
-     When employees are deleted & re-imported they get new UUIDs.
-     This function tries to re-link orphaned payroll records by
-     matching monthly_salary to a unique employee. Runs silently
-     on each payroll page load; saves state only if repairs made. */
-  async function _repairPayrollLinks() {
-    const st   = SSIApp.getState();
-    const emps = st.employees || [];
-    const recs = st.payroll   || [];
-    if (!emps.length || !recs.length) return;
-
-    let repaired = 0;
-
-    // Build: emp_id → employee for fast lookup
-    const empById  = {};
-    emps.forEach(e => { empById[e.id] = e; });
-
-    // Build: salary → [employees] for matching heuristic
-    // Try monthly_salary, then bank+cash total
-    const empBySal = {};
-    emps.forEach(e => {
-      const sal1 = e.monthly_salary || 0;
-      const sal2 = (e.bank_salary||0) + (e.cash_salary||0);
-      const sal  = sal1 > 0 ? sal1 : sal2;
-      if (sal <= 0) return; // skip ₹0 salary employees (can't match)
-      if (!empBySal[sal]) empBySal[sal] = [];
-      empBySal[sal].push(e);
+// Employee Management
+async function loadEmployeeManagement(content, user) {
+    const employees = await API.getAll('employees');
+    
+    // Sort: Partners first, then by emp_id
+    employees.sort((a, b) => {
+        if (a.employee_type === 'Partner' && b.employee_type !== 'Partner') return -1;
+        if (a.employee_type !== 'Partner' && b.employee_type === 'Partner') return 1;
+        return a.emp_id.localeCompare(b.emp_id);
     });
+    
+    // Separate Workers and Staff
+    const workersOnly = employees.filter(e => e.employee_type === 'Worker');
+    const staffOnly = employees.filter(e => e.employee_type === 'Staff' || e.employee_type === 'Partner');
+    
+    const activeEmployees = employees.filter(e => e.is_active);
+    const modinagarCount = activeEmployees.filter(e => e.unit === 'Modinagar').length;
+    const patlaCount = activeEmployees.filter(e => e.unit === 'Patla').length;
+    
+    content.innerHTML = `
+        <div class="mb-6 flex justify-between items-center">
+            <div>
+                <h1 class="text-3xl font-bold text-gray-800">Employee Management</h1>
+                <p class="text-gray-600">Manage employees and workers across both units</p>
+            </div>
+            <div class="flex space-x-2">
+                <button onclick="showBulkEmployeeUpload()" class="bg-green-600 text-white px-6 py-3 rounded-lg hover:bg-green-700 transition duration-200">
+                    <i class="fas fa-upload mr-2"></i>Bulk Upload
+                </button>
+                <button onclick="showAddEmployeeModal()" class="bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700 transition duration-200">
+                    <i class="fas fa-plus mr-2"></i>Add Employee
+                </button>
+            </div>
+        </div>
+        
+        <!-- Stats -->
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-6">
+            <div class="bg-white rounded-lg shadow p-6">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <p class="text-gray-500 text-sm font-medium">Total Active</p>
+                        <p class="text-3xl font-bold text-gray-800 mt-2">${activeEmployees.length}</p>
+                    </div>
+                    <div class="bg-blue-100 p-3 rounded-full">
+                        <i class="fas fa-users text-2xl text-blue-600"></i>
+                    </div>
+                </div>
+            </div>
+            <div class="bg-white rounded-lg shadow p-6">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <p class="text-gray-500 text-sm font-medium">Modinagar (HO)</p>
+                        <p class="text-3xl font-bold text-blue-600 mt-2">${modinagarCount}</p>
+                    </div>
+                    <div class="bg-blue-100 p-3 rounded-full">
+                        <i class="fas fa-industry text-2xl text-blue-600"></i>
+                    </div>
+                </div>
+            </div>
+            <div class="bg-white rounded-lg shadow p-6">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <p class="text-gray-500 text-sm font-medium">Patla Unit</p>
+                        <p class="text-3xl font-bold text-green-600 mt-2">${patlaCount}</p>
+                    </div>
+                    <div class="bg-green-100 p-3 rounded-full">
+                        <i class="fas fa-industry text-2xl text-green-600"></i>
+                    </div>
+                </div>
+            </div>
+            <div class="bg-white rounded-lg shadow p-6">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <p class="text-gray-500 text-sm font-medium">Partners</p>
+                        <p class="text-3xl font-bold text-purple-600 mt-2">${employees.filter(e => e.employee_type === 'Partner').length}</p>
+                    </div>
+                    <div class="bg-purple-100 p-3 rounded-full">
+                        <i class="fas fa-crown text-2xl text-purple-600"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Employee List -->
+        <div class="bg-white rounded-lg shadow overflow-hidden">
+            <div class="p-4 border-b flex justify-between items-center">
+                <input type="text" id="employeeSearch" placeholder="Search employees..." 
+                    class="flex-1 px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 mr-4"
+                    onkeyup="searchEmployees()">
+                <div class="flex space-x-2">
+                    <button onclick="showWorkers()" class="emp-type-filter-btn px-4 py-2 rounded-lg bg-green-600 text-white text-sm" data-type="workers">
+                        <i class="fas fa-hard-hat mr-2"></i>Workers
+                    </button>
+                    <button onclick="promptStaffPassword()" class="emp-type-filter-btn px-4 py-2 rounded-lg bg-orange-600 text-white text-sm" data-type="staff">
+                        <i class="fas fa-lock mr-2"></i>View Staff
+                    </button>
+                    <button onclick="filterEmployeesByUnit('all')" class="emp-filter-btn px-4 py-2 rounded-lg bg-blue-600 text-white text-sm" data-unit="all">All Units</button>
+                    <button onclick="filterEmployeesByUnit('Modinagar')" class="emp-filter-btn px-4 py-2 rounded-lg bg-gray-200 text-sm" data-unit="Modinagar">Modinagar</button>
+                    <button onclick="filterEmployeesByUnit('Patla')" class="emp-filter-btn px-4 py-2 rounded-lg bg-gray-200 text-sm" data-unit="Patla">Patla</button>
+                </div>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full" id="employeeTable">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="text-left py-3 px-4">Emp ID</th>
+                            <th class="text-left py-3 px-4">Name</th>
+                            <th class="text-left py-3 px-4">Type</th>
+                            <th class="text-left py-3 px-4">Designation</th>
+                            <th class="text-left py-3 px-4">Unit</th>
+                            <th class="text-left py-3 px-4">Basic Salary</th>
+                            <th class="text-left py-3 px-4">HRA</th>
+                            <th class="text-left py-3 px-4">ESI/EPF</th>
+                            <th class="text-left py-3 px-4">Status</th>
+                            <th class="text-left py-3 px-4">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="employeeTableBody">
+                        ${workersOnly.map(emp => `
+                            <tr class="border-b hover:bg-gray-50 employee-row" data-unit="${emp.unit}" data-type="worker">
+                                <td class="py-3 px-4 font-bold">${emp.emp_id}</td>
+                                <td class="py-3 px-4">
+                                    <div class="font-medium">${emp.full_name}</div>
+                                </td>
+                                <td class="py-3 px-4">
+                                    <span class="px-2 py-1 rounded-full text-xs bg-green-100 text-green-800">${emp.employee_type}</span>
+                                </td>
+                                    }">${emp.employee_type}</span>
+                                </td>
+                                <td class="py-3 px-4">${emp.designation}</td>
+                                <td class="py-3 px-4">${emp.unit}</td>
+                                <td class="py-3 px-4">${Utils.formatCurrency(emp.basic_salary, 'INR')}</td>
+                                <td class="py-3 px-4">${Utils.formatCurrency(emp.hra || 0, 'INR')}</td>
+                                <td class="py-3 px-4">
+                                    ${emp.is_esi_applicable ? '<span class="text-xs bg-blue-100 text-blue-800 px-2 py-1 rounded mr-1">ESI</span>' : ''}
+                                    ${emp.is_epf_applicable ? '<span class="text-xs bg-green-100 text-green-800 px-2 py-1 rounded">EPF</span>' : ''}
+                                    ${!emp.is_esi_applicable && !emp.is_epf_applicable ? '<span class="text-xs text-gray-400">N/A</span>' : ''}
+                                </td>
+                                <td class="py-3 px-4">
+                                    ${emp.is_active ? 
+                                        '<span class="px-3 py-1 rounded-full text-sm bg-green-100 text-green-800">Active</span>' :
+                                        '<span class="px-3 py-1 rounded-full text-sm bg-red-100 text-red-800">Inactive</span>'
+                                    }
+                                </td>
+                                <td class="py-3 px-4">
+                                    <button onclick="viewEmployee('${emp.id}')" class="text-blue-600 hover:text-blue-800 mr-2" title="View">
+                                        <i class="fas fa-eye"></i>
+                                    </button>
+                                    ${user.role === 'Admin' ? `
+                                        <button onclick="editEmployee('${emp.id}')" class="text-green-600 hover:text-green-800 mr-2" title="Edit">
+                                            <i class="fas fa-edit"></i>
+                                        </button>
+                                        ${emp.is_active ? `
+                                            <button onclick="markEmployeeExit('${emp.id}')" class="text-red-600 hover:text-red-800" title="Mark Exit">
+                                                <i class="fas fa-sign-out-alt"></i>
+                                            </button>
+                                        ` : ''}
+                                    ` : ''}
+                                </td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    `;
+    
+    window.allEmployees = employees;
+}
 
-    // Find broken records: emp_id not in current employees
-    const brokenIds = new Set(
-      recs.filter(p => !empById[p.emp_id] && !p.emp_code && !p.emp_name)
-          .map(p => p.emp_id)
-    );
-
-    if (!brokenIds.size) return; // Nothing to repair
-
-    // For each broken emp_id, collect all payroll records to determine salary
-    const brokenMap = {}; // emp_id → { salary, type }
-    recs.forEach(p => {
-      if (!brokenIds.has(p.emp_id)) return;
-      if (!brokenMap[p.emp_id]) brokenMap[p.emp_id] = { salary: p.monthly_salary, recs: [] };
-      brokenMap[p.emp_id].recs.push(p);
+function filterEmployeesByUnit(unit) {
+    const rows = document.querySelectorAll('#employeeTable tbody tr');
+    rows.forEach(row => {
+        if (unit === 'all') {
+            row.style.display = '';
+        } else {
+            row.style.display = row.dataset.unit === unit ? '' : 'none';
+        }
     });
+    
+    // Update button styles
+    document.querySelectorAll('.emp-filter-btn').forEach(btn => {
+        btn.classList.remove('bg-blue-600', 'text-white');
+        btn.classList.add('bg-gray-200');
+    });
+    document.querySelector(`[data-unit="${unit}"]`).classList.add('bg-blue-600', 'text-white');
+    document.querySelector(`[data-unit="${unit}"]`).classList.remove('bg-gray-200');
+}
 
-    // Track which employees are already matched (avoid double-linking)
-    const matchedEmpIds = new Set(recs.filter(p => empById[p.emp_id]).map(p => p.emp_id));
+function searchEmployees() {
+    const searchTerm = document.getElementById('employeeSearch').value.toLowerCase();
+    const rows = document.querySelectorAll('#employeeTable tbody tr');
+    
+    rows.forEach(row => {
+        const text = row.textContent.toLowerCase();
+        row.style.display = text.includes(searchTerm) ? '' : 'none';
+    });
+}
 
-    for (const [brokenEmpId, info] of Object.entries(brokenMap)) {
-      const sal = info.salary;
-      const candidates = (empBySal[sal] || []).filter(e => !matchedEmpIds.has(e.id));
-
-      if (candidates.length !== 1) continue; // Ambiguous or no match — skip
-
-      const emp  = candidates[0];
-      const unit = (st.units || []).find(u => u.id === emp.unit_id);
-      matchedEmpIds.add(emp.id);
-
-      // Patch all payroll records for this broken emp_id
-      info.recs.forEach(p => {
-        p.emp_id    = emp.id;        // Fix the link
-        p.emp_name  = emp.name || '';
-        p.emp_code  = emp.emp_code || '';
-        p.emp_type  = emp.type || '';
-        p.unit_name = unit?.name || '';
-      });
-      repaired += info.recs.length;
-      console.log('[SSI Payroll] Repaired', info.recs.length, 'records → linked to', emp.emp_code, emp.name);
+// Password protection for Staff view
+function promptStaffPassword() {
+    if (staffViewUnlocked) {
+        showStaff();
+        return;
     }
-
-    if (repaired > 0) {
-      await SSIApp.saveState(st);
-      console.log('[SSI Payroll] Auto-repair saved:', repaired, 'records fixed');
+    
+    const password = prompt('Enter password to view Staff details:');
+    if (password === STAFF_VIEW_PASSWORD) {
+        staffViewUnlocked = true;
+        Utils.showNotification('Access granted! Showing Staff members.', 'success');
+        showStaff();
+    } else if (password !== null) {
+        Utils.showNotification('Incorrect password! Access denied.', 'error');
     }
-  }
+}
 
-  /* ── Display fields helper (emp live → stored snapshot → '—') */
-  function _empDisplay(emp, p) {
-    const unit = (SSIApp.getState().units || []).find(u => u.id === emp?.unit_id);
-    return {
-      name: emp?.name     || p.emp_name  || '—',
-      code: emp?.emp_code || p.emp_code  || '',
-      type: emp?.type     || p.emp_type  || '',
-      unit: unit?.name    || p.unit_name || '—',
-    };
-  }
+async function showWorkers() {
+    const employees = await API.getAll('employees');
+    const workersOnly = employees.filter(e => e.employee_type === 'Worker');
+    renderEmployeeTable(workersOnly, 'workers');
+}
 
-  /* ── render ─────────────────────────────────────────────── */
-  function render(area) {
-    if (!SSIApp.hasRole('ADMIN','ACCOUNTANT','ACCOUNTS')) {
-      area.innerHTML = '<div class="empty-state"><div class="icon">🔒</div><p>Access Denied</p></div>';
-      return;
+async function showStaff() {
+    const employees = await API.getAll('employees');
+    const staffOnly = employees.filter(e => e.employee_type === 'Staff' || e.employee_type === 'Partner');
+    renderEmployeeTable(staffOnly, 'staff');
+}
+
+function renderEmployeeTable(employees, type) {
+    const tbody = document.getElementById('employeeTableBody');
+    
+    employees.sort((a, b) => {
+        if (a.employee_type === 'Partner' && b.employee_type !== 'Partner') return -1;
+        if (a.employee_type !== 'Partner' && b.employee_type === 'Partner') return 1;
+        return a.emp_id.localeCompare(b.emp_id);
+    });
+    
+    const user = JSON.parse(sessionStorage.getItem('currentUser'));
+    
+    tbody.innerHTML = employees.map(emp => `
+        <tr class="border-b hover:bg-gray-50 employee-row ${emp.employee_type === 'Partner' ? 'bg-purple-50' : ''}" data-unit="${emp.unit}" data-type="${type}">
+            <td class="py-3 px-4 font-bold">${emp.emp_id}</td>
+            <td class="py-3 px-4">
+                <div class="font-medium">${emp.full_name}</div>
+                ${emp.employee_type === 'Partner' ? '<span class="text-xs text-purple-600 font-bold">👑 PARTNER</span>' : ''}
+            </td>
+            <td class="py-3 px-4">
+                <span class="px-2 py-1 rounded-full text-xs ${
+                    emp.employee_type === 'Partner' ? 'bg-purple-100 text-purple-800' :
+                    emp.employee_type === 'Staff' ? 'bg-blue-100 text-blue-800' :
+                    'bg-green-100 text-green-800'
+                }">${emp.employee_type}</span>
+            </td>
+            <td class="py-3 px-4">${emp.designation}</td>
+            <td class="py-3 px-4">${emp.unit}</td>
+            <td class="py-3 px-4">${Utils.formatCurrency(emp.basic_salary, 'INR')}</td>
+            <td class="py-3 px-4">${Utils.formatCurrency(emp.hra || 0, 'INR')}</td>
+            <td class="py-3 px-4">
+                ${emp.is_esi_applicable ? '<span class="text-xs bg-blue-100 text-blue-800 px-2 py-1 rounded mr-1">ESI</span>' : ''}
+                ${emp.is_epf_applicable ? '<span class="text-xs bg-green-100 text-green-800 px-2 py-1 rounded">EPF</span>' : ''}
+                ${!emp.is_esi_applicable && !emp.is_epf_applicable ? '<span class="text-xs text-gray-400">N/A</span>' : ''}
+            </td>
+            <td class="py-3 px-4">
+                ${emp.is_active ? 
+                    '<span class="px-3 py-1 rounded-full text-sm bg-green-100 text-green-800">Active</span>' :
+                    '<span class="px-3 py-1 rounded-full text-sm bg-red-100 text-red-800">Inactive</span>'
+                }
+            </td>
+            <td class="py-3 px-4">
+                <button onclick="viewEmployee('${emp.id}')" class="text-blue-600 hover:text-blue-800 mr-2" title="View">
+                    <i class="fas fa-eye"></i>
+                </button>
+                ${user.role === 'Admin' ? `
+                    <button onclick="editEmployee('${emp.id}')" class="text-green-600 hover:text-green-800 mr-2" title="Edit">
+                        <i class="fas fa-edit"></i>
+                    </button>
+                    ${emp.is_active ? `
+                        <button onclick="markEmployeeExit('${emp.id}')" class="text-red-600 hover:text-red-800" title="Mark Exit">
+                            <i class="fas fa-sign-out-alt"></i>
+                        </button>
+                    ` : ''}
+                ` : ''}
+            </td>
+        </tr>
+    `).join('');
+    
+    // Update button styles
+    document.querySelectorAll('.emp-type-filter-btn').forEach(btn => {
+        btn.classList.remove('bg-green-600', 'bg-orange-600', 'text-white');
+        btn.classList.add('bg-gray-200', 'text-gray-800');
+    });
+    
+    const activeBtn = document.querySelector(`[data-type="${type}"]`);
+    if (activeBtn) {
+        activeBtn.classList.remove('bg-gray-200', 'text-gray-800');
+        if (type === 'workers') {
+            activeBtn.classList.add('bg-green-600', 'text-white');
+        } else {
+            activeBtn.classList.add('bg-orange-600', 'text-white');
+        }
     }
-    refresh(area);
-  }
+}
 
-  function refresh(area) {
-    // Auto-repair broken employee links (silent, saves only if needed)
-    _repairPayrollLinks().then(() => {
-      _doRefresh(area);
+
+// Generate next employee ID
+async function generateNextEmployeeId(employeeType, unit) {
+    const employees = await API.getAll('employees');
+    const prefix = employeeType === 'Staff' ? 'SSIA' : 'SSIB';
+    
+    // Get existing IDs with this prefix
+    const existingIds = employees
+        .filter(e => e.emp_id.startsWith(prefix))
+        .map(e => parseInt(e.emp_id.replace(prefix, '')))
+        .filter(num => !isNaN(num));
+    
+    // Find next available number
+    let nextNum = existingIds.length > 0 ? Math.max(...existingIds) + 1 : (prefix === 'SSIA' ? 4 : 1); // Start from 4 for SSIA (partners 1-3)
+    
+    return `${prefix}${String(nextNum).padStart(3, '0')}`;
+}
+
+async function showAddEmployeeModal() {
+    const formHtml = `
+        <form id="addEmployeeForm" class="space-y-4">
+            <div class="bg-blue-50 p-4 rounded-lg mb-4">
+                <p class="text-sm text-blue-800"><i class="fas fa-info-circle mr-2"></i>
+                Employee ID will be auto-generated: SSIA for Staff, SSIB for Workers</p>
+            </div>
+            
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Full Name *</label>
+                    <input type="text" name="full_name" required class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Employee Type *</label>
+                    <select name="employee_type" id="employeeTypeSelect" required onchange="updateEmployeeTypeFields()" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        <option value="">Select Type</option>
+                        <option value="Staff">Staff</option>
+                        <option value="Worker">Worker</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Unit *</label>
+                    <select name="unit" required class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        <option value="">Select Unit</option>
+                        <option value="Modinagar">Modinagar (HO)</option>
+                        <option value="Patla">Patla</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Designation *</label>
+                    <input type="text" name="designation" required class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Date of Joining *</label>
+                    <input type="date" name="date_of_joining" required class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Phone *</label>
+                    <input type="tel" name="phone" required class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div class="md:col-span-2">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Email</label>
+                    <input type="email" name="email" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div class="md:col-span-2">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Address *</label>
+                    <textarea name="address" required rows="2" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"></textarea>
+                </div>
+                
+                <!-- Salary Section -->
+                <div class="md:col-span-2 border-t pt-4">
+                    <h3 class="font-bold text-gray-800 mb-3">Salary Structure</h3>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Basic Salary *</label>
+                    <input type="number" name="basic_salary" id="basicSalaryInput" required min="0" step="0.01" onchange="calculateGrossSalary()" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">HRA (Optional)</label>
+                    <input type="number" name="hra" id="hraInput" min="0" step="0.01" onchange="calculateGrossSalary()" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="0">
+                </div>
+                <div class="md:col-span-2">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Gross Salary (Auto)</label>
+                    <input type="number" id="grossSalaryDisplay" readonly class="w-full px-4 py-2 border rounded-lg bg-gray-100 font-bold">
+                </div>
+                
+                <!-- Statutory Section -->
+                <div class="md:col-span-2 border-t pt-4">
+                    <h3 class="font-bold text-gray-800 mb-3">Statutory Details</h3>
+                </div>
+                <div>
+                    <label class="flex items-center">
+                        <input type="checkbox" name="is_esi_applicable" id="esiCheck" onchange="updateStatutoryFields()" class="mr-2">
+                        <span class="text-sm font-medium text-gray-700">ESI Applicable</span>
+                    </label>
+                </div>
+                <div id="esiNumberField" style="display:none;">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">ESI Number</label>
+                    <input type="text" name="esi_number" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div>
+                    <label class="flex items-center">
+                        <input type="checkbox" name="is_epf_applicable" id="epfCheck" onchange="updateStatutoryFields()" class="mr-2">
+                        <span class="text-sm font-medium text-gray-700">EPF Applicable (Coming Soon)</span>
+                    </label>
+                </div>
+                <div id="epfNumberField" style="display:none;">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">EPF Number</label>
+                    <input type="text" name="epf_number" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                
+                <!-- Bank Details -->
+                <div class="md:col-span-2 border-t pt-4">
+                    <h3 class="font-bold text-gray-800 mb-3">Bank Details</h3>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Bank Account Number</label>
+                    <input type="text" name="bank_account" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Bank IFSC Code</label>
+                    <input type="text" name="bank_ifsc" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                
+                <!-- Additional Info -->
+                <div id="overtimeField" class="md:col-span-2" style="display:none;">
+                    <label class="flex items-center">
+                        <input type="checkbox" name="overtime_eligible" class="mr-2">
+                        <span class="text-sm font-medium text-gray-700">Overtime Eligible (for Workers only)</span>
+                    </label>
+                </div>
+            </div>
+            
+            <div class="flex justify-end space-x-4 mt-6">
+                <button type="button" onclick="closeModal()" class="px-6 py-2 border rounded-lg hover:bg-gray-50 transition duration-200">
+                    Cancel
+                </button>
+                <button type="submit" class="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 transition duration-200">
+                    <i class="fas fa-save mr-2"></i>Save Employee
+                </button>
+            </div>
+        </form>
+    `;
+    
+    showModal('Add New Employee', formHtml, 'max-w-4xl');
+    
+    document.getElementById('addEmployeeForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const formData = new FormData(e.target);
+        
+        const employeeType = formData.get('employee_type');
+        const unit = formData.get('unit');
+        const empId = await generateNextEmployeeId(employeeType, unit);
+        
+        const employeeData = {
+            id: Utils.generateId('emp'),
+            emp_id: empId,
+            full_name: formData.get('full_name'),
+            employee_type: employeeType,
+            unit: unit,
+            designation: formData.get('designation'),
+            date_of_joining: formData.get('date_of_joining'),
+            date_of_exit: null,
+            is_active: true,
+            phone: formData.get('phone'),
+            email: formData.get('email') || '',
+            address: formData.get('address'),
+            esi_number: formData.get('esi_number') || '',
+            epf_number: formData.get('epf_number') || '',
+            bank_account: formData.get('bank_account') || '',
+            bank_ifsc: formData.get('bank_ifsc') || '',
+            basic_salary: parseFloat(formData.get('basic_salary')),
+            hra: parseFloat(formData.get('hra')) || 0,
+            is_esi_applicable: formData.get('is_esi_applicable') === 'on',
+            is_epf_applicable: formData.get('is_epf_applicable') === 'on',
+            overtime_eligible: formData.get('overtime_eligible') === 'on',
+            monthly_leaves_allowed: employeeType === 'Staff' ? 2 : 0
+        };
+        
+        try {
+            await API.create('employees', employeeData);
+            Utils.showNotification(`Employee added successfully with ID: ${empId}`, 'success');
+            closeModal();
+            loadPage('payroll-employees');
+        } catch (error) {
+            Utils.showNotification('Error adding employee', 'error');
+        }
     });
-  }
+}
 
-  function _doRefresh(area) {
-    const st    = SSIApp.getState();
-    const today = new Date().toISOString().slice(0,7);
-    const isAdmin = SSIApp.hasRole('ADMIN');
-    const isAccountsOnly = SSIApp.hasRole('ACCOUNTS');  // ACCOUNTS: payroll workers only
-
-    // Payroll records grouped by period
-    const payrolls = st.payroll || [];
-    // Unique periods
-    const periods = [...new Set(payrolls.map(p=>p.period))].sort().reverse();
-
-    area.innerHTML = `
-      <div class="page-header">
-        <h2 class="page-title">💰 Payroll</h2>
-        <div style="display:flex;gap:10px;flex-wrap:wrap;">
-          <button class="btn btn-secondary btn-sm" onclick="SSIPayroll.exportExcel()">📤 Export</button>
-          <button class="btn btn-primary" onclick="SSIPayroll.openGenerateModal()">⚙️ Generate Payroll</button>
-        </div>
-      </div>
-
-      <!-- Orphan warning banner -->
-      <div id="pr-orphan-banner" style="display:none;background:#fef3c7;border:1px solid #f59e0b;border-radius:10px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:#92400e;"></div>
-
-      <!-- Period selector -->
-      <div class="card" style="margin-bottom:16px;padding:16px;">
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;align-items:end;">
-          <div>
-            <label>Payroll Month</label>
-            <select id="pr-filter-period" onchange="SSIPayroll.applyFilter()">
-              <option value="">All Months</option>
-              ${periods.map(p=>`<option value="${p}">${_fmtPeriod(p)}</option>`).join('')}
-            </select>
-          </div>
-          <div>
-            <label>Employee Type</label>
-            <select id="pr-filter-type" onchange="SSIPayroll.applyFilter()">
-              <option value="">All</option>
-              <option value="WORKER">👷 Workers</option>
-              ${(isAdmin) ? '<option value="STAFF">👔 Staff</option>' : ''}
-            </select>
-          </div>
-          <div>
-            <label>Unit</label>
-            <select id="pr-filter-unit" onchange="SSIPayroll.applyFilter()">
-              <option value="">All Units</option>
-              ${(st.units||[]).filter(u=>u.active).map(u=>`<option value="${u.id}">${u.name}</option>`).join('')}
-            </select>
-          </div>
-          <div>
-            <label>Status</label>
-            <select id="pr-filter-status" onchange="SSIPayroll.applyFilter()">
-              <option value="">All</option>
-              <option value="DRAFT">Draft</option>
-              <option value="PROCESSED">Processed</option>
-              <option value="PAID">Paid</option>
-            </select>
-          </div>
-        </div>
-      </div>
-
-      <!-- Summary -->
-      <div id="pr-summary" style="margin-bottom:16px;"></div>
-
-      <!-- Table -->
-      <div class="card" style="overflow-x:auto;">
-        <table id="pr-table">
-          <thead><tr>
-            <th>Period</th><th>Employee</th><th>Type</th><th>Unit</th>
-            <th style="text-align:right;">Monthly Sal.</th>
-            <th style="text-align:center;">Days P</th>
-            <th style="text-align:center;">H</th>
-            <th style="text-align:center;">L</th>
-            <th style="text-align:center;">Paid L</th>
-            <th style="text-align:right;">OT Hrs</th>
-            <th style="text-align:right;">OT Amt</th>
-            <th style="text-align:right;">Deduct.</th>
-            <th style="text-align:right;">Gross</th>
-            <th style="text-align:right;">Net Pay</th>
-            <th>Status</th>
-            <th>Actions</th>
-          </tr></thead>
-          <tbody id="pr-tbody"><tr><td colspan="16" style="text-align:center;padding:40px;color:#94a3b8;">Select a month and generate payroll to begin.</td></tr></tbody>
-        </table>
-        <div id="pr-total-row" style="padding:12px 16px;font-size:13px;color:#64748b;text-align:right;"></div>
-      </div>`;
-
-    applyFilter();
-  }
-
-  function applyFilter() {
-    const st       = SSIApp.getState();
-    const isAdmin  = SSIApp.hasRole('ADMIN');
-    const isAccountsOnly = SSIApp.hasRole('ACCOUNTS');
-    const period   = document.getElementById('pr-filter-period')?.value  || '';
-    const typeF    = document.getElementById('pr-filter-type')?.value    || '';
-    const unitF    = document.getElementById('pr-filter-unit')?.value    || '';
-    const statusF  = document.getElementById('pr-filter-status')?.value  || '';
-
-    let list = (st.payroll||[]).filter(p => {
-      // ACCOUNTANT and ACCOUNTS see workers only
-      const emp = _findEmp(st, p);
-      const empType = emp?.type || p.emp_type || '';
-      if (!isAdmin && empType === 'STAFF') return false;
-      if (period  && p.period   !== period)  return false;
-      if (typeF   && empType    !== typeF)   return false;
-      if (unitF   && emp?.unit_id !== unitF) return false;
-      if (statusF && p.status   !== statusF) return false;
-      return true;
-    });
-
-    list = list.sort((a,b) => {
-      if (b.period !== a.period) return b.period.localeCompare(a.period);
-      const ea = _findEmp(st, a);
-      const eb = _findEmp(st, b);
-      return ((ea?.name||a.emp_name||'')).localeCompare((eb?.name||b.emp_name||''));
-    });
-
-    // Summary
-    const totalNet    = list.reduce((s,p)=>s+p.net_pay,0);
-    const totalGross  = list.reduce((s,p)=>s+p.gross_pay,0);
-    const totalOT     = list.reduce((s,p)=>s+p.ot_amount,0);
-    const totalDeduct = list.reduce((s,p)=>s+p.deductions,0);
-    const paidCount   = list.filter(p=>p.status==='PAID').length;
-
-    const summaryEl = document.getElementById('pr-summary');
-    if (summaryEl) summaryEl.innerHTML = `
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px;">
-        <div style="background:#FDECEA;padding:14px 16px;border-radius:10px;"><div style="font-size:22px;font-weight:800;color:#922B21;">${list.length}</div><div style="font-size:12px;color:#922B21;">Records</div></div>
-        <div style="background:#dcfce7;padding:14px 16px;border-radius:10px;"><div style="font-size:22px;font-weight:800;color:#166534;">₹${_fmt(totalGross)}</div><div style="font-size:12px;color:#166534;">Gross Pay</div></div>
-        <div style="background:#fef3c7;padding:14px 16px;border-radius:10px;"><div style="font-size:22px;font-weight:800;color:#92400e;">₹${_fmt(totalOT)}</div><div style="font-size:12px;color:#92400e;">OT Amount</div></div>
-        <div style="background:#fee2e2;padding:14px 16px;border-radius:10px;"><div style="font-size:22px;font-weight:800;color:#991b1b;">₹${_fmt(totalDeduct)}</div><div style="font-size:12px;color:#991b1b;">Deductions</div></div>
-        <div style="background:#f0fdf4;padding:14px 16px;border-radius:10px;border:2px solid #166534;"><div style="font-size:22px;font-weight:800;color:#166534;">₹${_fmt(totalNet)}</div><div style="font-size:12px;color:#166534;">Net Payable</div></div>
-        <div style="background:#f5f3ff;padding:14px 16px;border-radius:10px;"><div style="font-size:22px;font-weight:800;color:#5b21b6;">${paidCount}/${list.length}</div><div style="font-size:12px;color:#5b21b6;">Paid</div></div>
-      </div>`;
-
-    const tbody = document.getElementById('pr-tbody');
-    if (!tbody) return;
-    // Show warning if any visible records have no employee name (orphaned)
-    const orphaned = list.filter(p => !_findEmp(st, p) && !p.emp_name);
-    const orphanBanner = document.getElementById('pr-orphan-banner');
-    if (orphanBanner) {
-      if (orphaned.length > 0) {
-        orphanBanner.style.display = 'block';
-        orphanBanner.innerHTML = `⚠️ <strong>${orphaned.length} payroll record(s)</strong> have no linked employee — employees were deleted &amp; re-imported with new IDs. <button onclick="SSIPayroll.openRelinkModal()" style="margin-left:12px;background:#f59e0b;color:#fff;border:none;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:700;">🔗 Re-link Records</button>`;
-      } else {
-        orphanBanner.style.display = 'none';
-      }
+function updateEmployeeTypeFields() {
+    const type = document.getElementById('employeeTypeSelect').value;
+    const overtimeField = document.getElementById('overtimeField');
+    
+    if (type === 'Worker') {
+        overtimeField.style.display = 'block';
+    } else {
+        overtimeField.style.display = 'none';
     }
+}
 
-    if (!list.length) { tbody.innerHTML = `<tr><td colspan="16" style="text-align:center;padding:40px;color:#94a3b8;">No payroll records found.</td></tr>`; return; }
+function calculateGrossSalary() {
+    const basic = parseFloat(document.getElementById('basicSalaryInput').value) || 0;
+    const hra = parseFloat(document.getElementById('hraInput').value) || 0;
+    document.getElementById('grossSalaryDisplay').value = (basic + hra).toFixed(2);
+}
 
-    tbody.innerHTML = list.map(p => {
-      const emp  = _findEmp(st, p);
-      const { name: dName, code: dCode, type: dType, unit: dUnit } = _empDisplay(emp, p);
-      const st_badge = _statusBadge(p.status);
-      return `<tr>
-        <td style="white-space:nowrap;">${_fmtPeriod(p.period)}</td>
-        <td><b>${dName}</b><br><span style="font-size:11px;color:#64748b;">${dCode}</span></td>
-        <td><span style="background:${dType==='STAFF'?'#FDECEA':'#dcfce7'};color:${dType==='STAFF'?'#922B21':'#166534'};padding:2px 7px;border-radius:10px;font-size:11px;">${dType}</span></td>
-        <td>${dUnit}</td>
-        <td style="text-align:right;">₹${_fmt(p.monthly_salary)}</td>
-        <td style="text-align:center;">${p.present_days}</td>
-        <td style="text-align:center;">${p.half_days}</td>
-        <td style="text-align:center;">${p.leave_days}</td>
-        <td style="text-align:center;color:#3730a3;font-weight:600;">${p.paid_leaves}</td>
-        <td style="text-align:right;">${p.ot_hours}</td>
-        <td style="text-align:right;color:#f59e0b;font-weight:600;">${p.ot_amount>0?'₹'+_fmt(p.ot_amount):'—'}</td>
-        <td style="text-align:right;color:#991b1b;">${p.deductions>0?'₹'+_fmt(p.deductions):'—'}</td>
-        <td style="text-align:right;font-weight:600;">₹${_fmt(p.gross_pay)}</td>
-        <td style="text-align:right;font-weight:800;font-size:15px;color:#166534;">₹${_fmt(p.net_pay)}</td>
-        <td>${st_badge}</td>
-        <td style="white-space:nowrap;">
-          ${p.status!=='PAID' ? `<button class="btn btn-secondary btn-sm" onclick="SSIPayroll.openEdit('${p.id}')" title="Edit deductions/remarks">✏️</button>` : ''}
-                    ${(p.status!=='PAID'&&SSIApp.hasRole('ADMIN')) ? `<button class="btn btn-danger btn-sm" onclick="SSIPayroll.deletePayroll('${p.id}')" title="Delete record">🗑️</button>` : ''}
-          ${p.status!=='PAID' ? `<button class="btn btn-primary btn-sm" onclick="SSIPayroll.markPaid('${p.id}')" title="Mark as Paid" style="font-size:11px;">✅ Paid</button>` : ''}
-          <button class="btn btn-secondary btn-sm" onclick="SSIPayroll.printSlip('${p.id}')" title="Print Slip">🖨️</button>
-        </td>
-      </tr>`;
-    }).join('');
-  }
+function updateStatutoryFields() {
+    const esiCheck = document.getElementById('esiCheck').checked;
+    const epfCheck = document.getElementById('epfCheck').checked;
+    
+    document.getElementById('esiNumberField').style.display = esiCheck ? 'block' : 'none';
+    document.getElementById('epfNumberField').style.display = epfCheck ? 'block' : 'none';
+}
 
-  /* ── Generate Payroll Modal ──────────────────────────────── */
-  function openGenerateModal() {
-    if (!SSIApp.hasRole('ADMIN','ACCOUNTANT','ACCOUNTS')) return;
-    const st    = SSIApp.getState();
-    const today = new Date().toISOString().slice(0,7);
-    const isAdmin = SSIApp.hasRole('ADMIN');
-
-    SSIApp.modal(`
-      <h3 style="margin-bottom:16px;">⚙️ Generate Payroll</h3>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;">
-        <div>
-          <label>Month *</label>
-          <input type="month" id="gen-month" value="${today}">
+async function viewEmployee(empId) {
+    const employee = await API.getById('employees', empId);
+    
+    const detailsHtml = `
+        <div class="space-y-4">
+            <div class="flex items-center justify-between mb-4">
+                <div>
+                    <h3 class="text-2xl font-bold">${employee.full_name}</h3>
+                    <p class="text-gray-600">${employee.designation} - ${employee.unit}</p>
+                </div>
+                <div class="text-right">
+                    <p class="text-sm text-gray-500">Employee ID</p>
+                    <p class="text-xl font-bold text-blue-600">${employee.emp_id}</p>
+                </div>
+            </div>
+            
+            <div class="grid grid-cols-2 gap-4 border-t pt-4">
+                <div>
+                    <p class="text-sm text-gray-600">Type</p>
+                    <p class="font-medium">${employee.employee_type}</p>
+                </div>
+                <div>
+                    <p class="text-sm text-gray-600">Status</p>
+                    <p class="font-medium">${employee.is_active ? 'Active' : 'Inactive'}</p>
+                </div>
+                <div>
+                    <p class="text-sm text-gray-600">Date of Joining</p>
+                    <p class="font-medium">${Utils.formatDate(employee.date_of_joining)}</p>
+                </div>
+                <div>
+                    <p class="text-sm text-gray-600">Phone</p>
+                    <p class="font-medium">${employee.phone}</p>
+                </div>
+                ${employee.email ? `
+                    <div class="col-span-2">
+                        <p class="text-sm text-gray-600">Email</p>
+                        <p class="font-medium">${employee.email}</p>
+                    </div>
+                ` : ''}
+                <div class="col-span-2">
+                    <p class="text-sm text-gray-600">Address</p>
+                    <p class="font-medium">${employee.address}</p>
+                </div>
+            </div>
+            
+            <div class="border-t pt-4">
+                <h4 class="font-bold text-gray-800 mb-3">Salary Structure</h4>
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <p class="text-sm text-gray-600">Basic Salary</p>
+                        <p class="font-bold text-lg">${Utils.formatCurrency(employee.basic_salary, 'INR')}</p>
+                    </div>
+                    <div>
+                        <p class="text-sm text-gray-600">HRA</p>
+                        <p class="font-bold text-lg">${Utils.formatCurrency(employee.hra || 0, 'INR')}</p>
+                    </div>
+                    <div class="col-span-2">
+                        <p class="text-sm text-gray-600">Gross Salary</p>
+                        <p class="font-bold text-xl text-green-600">${Utils.formatCurrency((employee.basic_salary + (employee.hra || 0)), 'INR')}</p>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="border-t pt-4">
+                <h4 class="font-bold text-gray-800 mb-3">Statutory Details</h4>
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <p class="text-sm text-gray-600">ESI</p>
+                        <p class="font-medium">${employee.is_esi_applicable ? `✓ ${employee.esi_number || 'Applied'}` : '✗ Not Applicable'}</p>
+                    </div>
+                    <div>
+                        <p class="text-sm text-gray-600">EPF</p>
+                        <p class="font-medium">${employee.is_epf_applicable ? `✓ ${employee.epf_number || 'Applied'}` : '✗ Not Applicable'}</p>
+                    </div>
+                    <div>
+                        <p class="text-sm text-gray-600">Overtime Eligible</p>
+                        <p class="font-medium">${employee.overtime_eligible ? '✓ Yes' : '✗ No'}</p>
+                    </div>
+                    <div>
+                        <p class="text-sm text-gray-600">Monthly Leaves</p>
+                        <p class="font-medium">${employee.monthly_leaves_allowed} days</p>
+                    </div>
+                </div>
+            </div>
+            
+            ${employee.bank_account ? `
+                <div class="border-t pt-4">
+                    <h4 class="font-bold text-gray-800 mb-3">Bank Details</h4>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <p class="text-sm text-gray-600">Account Number</p>
+                            <p class="font-medium">${employee.bank_account}</p>
+                        </div>
+                        <div>
+                            <p class="text-sm text-gray-600">IFSC Code</p>
+                            <p class="font-medium">${employee.bank_ifsc}</p>
+                        </div>
+                    </div>
+                </div>
+            ` : ''}
         </div>
-        <div>
-          <label>Employee Type</label>
-          <select id="gen-type">
-            <option value="">All</option>
-            <option value="WORKER">👷 Workers Only</option>
-            ${(isAdmin) ? '<option value="STAFF">👔 Staff Only</option>' : ''}
-          </select>
-        </div>
-        <div>
-          <label>Unit</label>
-          <select id="gen-unit">
-            <option value="">All Units</option>
-            ${(st.units||[]).filter(u=>u.active).map(u=>`<option value="${u.id}">${u.name}</option>`).join('')}
-          </select>
-        </div>
-        <div style="background:#e0f2fe;border-radius:8px;padding:10px;font-size:12px;color:#0369a1;">
-          <b>ℹ️ OT Rate</b><br>Auto = Monthly ÷ days ÷ 8 hrs<br>e.g. ₹15,000 salary in 31-day month = ₹60.48/hr</div>
-      </div>
-      <div style="background:#fef3c7;border-radius:8px;padding:12px;font-size:13px;margin-bottom:16px;">
-        <b>ℹ️ Rules applied:</b><br>
-        • Per day salary = Monthly ÷ actual days in selected month (28/29/30/31)<br>
-        • OT rate = (Monthly Salary ÷ days ÷ 8) per hour — auto-calculated<br>
-        • Staff: up to ${PAID_LEAVES_STAFF} leaves/month counted as Present<br>
-        • Workers: overtime eligible (Staff: no OT)<br>
-        • EPF = 12% of basic earnings (employer), ESI = 0.75% if Gross ≤ ₹21,000<br>
-        • Half day = 0.5 day pay<br>
-        • Existing payroll for same employee+month will be <b>overwritten</b> (if not PAID)
-      </div>
-      <div style="display:flex;gap:10px;justify-content:flex-end;">
-        <button class="btn btn-secondary" onclick="SSIApp.closeModal()">Cancel</button>
-        <button class="btn btn-primary" onclick="SSIPayroll.runGenerate()">⚙️ Generate Now</button>
-      </div>`);
-  }
+    `;
+    
+    showModal('Employee Details', detailsHtml, 'max-w-3xl');
+}
 
-  async function runGenerate() {
-    const month   = document.getElementById('gen-month')?.value;
-    const typeF   = document.getElementById('gen-type')?.value  || '';
-    const unitF   = document.getElementById('gen-unit')?.value  || '';
-    // OT rate is auto-calculated per employee (monthly / daysInMonth / 8)
-    if (!month) { SSIApp.toast('Select month'); return; }
-
-    const st      = SSIApp.getState();
-    const isAdmin = SSIApp.hasRole('ADMIN');
-    const isAccountsOnly = SSIApp.hasRole('ACCOUNTS');  // ACCOUNTS: workers only
-    if (!st.payroll) st.payroll = [];
-
-    let emps = (st.employees||[]).filter(e=>e.active!==false);
-    if (!isAdmin) emps = emps.filter(e=>e.type==='WORKER');  // Accountant/Accounts: workers only
-    if (typeF)    emps = emps.filter(e=>e.type===typeF);
-    if (unitF)    emps = emps.filter(e=>e.unit_id===unitF);
-
-    if (!emps.length) { SSIApp.toast('No employees match the filter'); return; }
-
-    const [yr, mo]    = month.split('-').map(Number);
-    const daysInMonth = new Date(yr, mo, 0).getDate();
-    const days        = Array.from({length:daysInMonth},(_,i)=>{
-      const d = String(i+1).padStart(2,'0');
-      return `${yr}-${String(mo).padStart(2,'0')}-${d}`;
+async function markEmployeeExit(empId) {
+    const employee = await API.getById('employees', empId);
+    
+    const formHtml = `
+        <form id="exitEmployeeForm" class="space-y-4">
+            <div class="bg-red-50 p-4 rounded-lg mb-4">
+                <p class="text-sm text-red-800"><i class="fas fa-exclamation-triangle mr-2"></i>
+                Mark employee as exited. They will be removed from active payroll but kept in records.</p>
+            </div>
+            
+            <div>
+                <p class="font-medium text-gray-800">Employee: ${employee.full_name} (${employee.emp_id})</p>
+            </div>
+            
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">Date of Exit *</label>
+                <input type="date" name="date_of_exit" required class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            
+            <div class="flex justify-end space-x-4 mt-6">
+                <button type="button" onclick="closeModal()" class="px-6 py-2 border rounded-lg hover:bg-gray-50 transition duration-200">
+                    Cancel
+                </button>
+                <button type="submit" class="bg-red-600 text-white px-6 py-2 rounded-lg hover:bg-red-700 transition duration-200">
+                    <i class="fas fa-sign-out-alt mr-2"></i>Mark Exit
+                </button>
+            </div>
+        </form>
+    `;
+    
+    showModal('Mark Employee Exit', formHtml);
+    
+    document.getElementById('exitEmployeeForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const formData = new FormData(e.target);
+        
+        try {
+            await API.patch('employees', empId, {
+                date_of_exit: formData.get('date_of_exit'),
+                is_active: false
+            });
+            Utils.showNotification('Employee marked as exited', 'success');
+            closeModal();
+            loadPage('payroll-employees');
+        } catch (error) {
+            Utils.showNotification('Error marking exit', 'error');
+        }
     });
+}
 
-    // Build attendance lookup for this month
-    const attRecs = (st.attendance||[]).filter(a=>a.date&&a.date.startsWith(month));
-    const attMap  = {};
-    attRecs.forEach(a => { attMap[`${a.emp_id}|${a.date}`] = a; });
-
-    let generated = 0, skipped = 0;
-
-    emps.forEach(emp => {
-      // Check if PAID already → skip
-      const existPaid = st.payroll.find(p=>p.emp_id===emp.id&&p.period===month&&p.status==='PAID');
-      if (existPaid) { skipped++; return; }
-
-      let present=0, half=0, leaves=0, absent=0, woff=0, otHours=0;
-      days.forEach(d => {
-        const rec = attMap[`${emp.id}|${d}`];
-        const s   = rec?.status || 'A';
-        if (s==='P')           { present++; if(rec?.ot_hours) otHours+=Number(rec.ot_hours); }
-        else if (s==='A')      absent++;
-        else if (s==='H')      { half++; if(rec?.ot_hours) otHours+=Number(rec.ot_hours); }
-        else if (s==='L')      leaves++;
-        else if (s==='WO'||s==='HD') woff++;
-      });
-
-      // Paid leaves for STAFF (max 2)
-      const paidLeaves = emp.type==='STAFF' ? Math.min(leaves, PAID_LEAVES_STAFF) : 0;
-
-      // Effective working days for salary calc
-      const effectiveDays = present + (half * 0.5) + paidLeaves;
-      const perDay        = Math.round(((emp.monthly_salary||0) / daysInMonth) * 100) / 100;
-      const otRate        = Math.round(((emp.monthly_salary||0) / daysInMonth / 8) * 100) / 100;
-      const grossBase     = Math.round(perDay * effectiveDays * 100) / 100;
-      const otAmount      = emp.type==='WORKER' ? Math.round(otHours * otRate * 100) / 100 : 0;
-      const grossPay      = Math.round((grossBase + otAmount) * 100) / 100;
-
-      // Existing deductions — keep if re-generating non-paid
-      const existing      = st.payroll.find(p=>p.emp_id===emp.id&&p.period===month);
-      const advance       = existing?.advance || 0;
-      const epfAmount     = Math.round(grossBase * EPF_RATE * 100) / 100;
-      const esiAmount     = grossPay <= ESI_LIMIT ? Math.round(grossPay * ESI_RATE * 100) / 100 : 0;
-      const totalDeduct   = Math.round((advance + epfAmount + esiAmount) * 100) / 100;
-      const deductions    = totalDeduct;  // for backward compat field
-      const netPay        = Math.max(0, Math.round((grossPay - totalDeduct) * 100) / 100);
-
-      const rec = {
-        id:             existing?.id || SSIApp.uid(),
-        emp_id:         emp.id,
-        emp_name:       emp.name||'',
-        emp_code:       emp.emp_code||'',
-        emp_type:       emp.type||'',
-        unit_name:      (SSIApp.getState().units||[]).find(u=>u.id===emp.unit_id)?.name||'',
-        period:         month,
-        monthly_salary: emp.monthly_salary||0,
-        working_days:   daysInMonth,
-        present_days:   present,
-        half_days:      half,
-        leave_days:     leaves,
-        paid_leaves:    paidLeaves,
-        absent_days:    absent,
-        week_offs:      woff,
-        ot_hours:       otHours,
-        ot_rate:        otRate,
-        ot_amount:      otAmount,
-        gross_pay:      grossPay,
-        advance:        advance,
-        epf_amount:     epfAmount,
-        esi_amount:     esiAmount,
-        deductions:     totalDeduct,
-        deduction_note: existing?.deduction_note || '',
-        net_pay:        netPay,
-        status:         existing?.status || 'DRAFT',
-        payment_date:   existing?.payment_date || '',
-        payment_mode:   existing?.payment_mode || '',
-        remarks:        existing?.remarks || '',
-        generated_by:   SSIApp.state.currentUser?.id||'',
-        generated_at:   new Date().toISOString(),
-      };
-
-      const idx = st.payroll.findIndex(p=>p.emp_id===emp.id&&p.period===month);
-      if (idx>=0) st.payroll[idx] = rec;
-      else        st.payroll.push(rec);
-      generated++;
+async function editEmployee(empId) {
+    const employee = await API.getById('employees', empId);
+    
+    const formHtml = `
+        <form id="editEmployeeForm" class="space-y-4">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Full Name *</label>
+                    <input type="text" name="full_name" value="${employee.full_name}" required class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Designation *</label>
+                    <input type="text" name="designation" value="${employee.designation}" required class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Phone *</label>
+                    <input type="tel" name="phone" value="${employee.phone}" required class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Email</label>
+                    <input type="email" name="email" value="${employee.email || ''}" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div class="md:col-span-2">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Address *</label>
+                    <textarea name="address" required rows="2" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">${employee.address}</textarea>
+                </div>
+                
+                <div class="md:col-span-2 border-t pt-4">
+                    <h3 class="font-bold text-gray-800 mb-3">Salary Structure</h3>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Basic Salary *</label>
+                    <input type="number" name="basic_salary" id="editBasicSalary" value="${employee.basic_salary}" required min="0" step="0.01" onchange="calculateEditGrossSalary()" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">HRA</label>
+                    <input type="number" name="hra" id="editHRA" value="${employee.hra || 0}" min="0" step="0.01" onchange="calculateEditGrossSalary()" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div class="md:col-span-2">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Gross Salary (Auto)</label>
+                    <input type="number" id="editGrossSalary" readonly class="w-full px-4 py-2 border rounded-lg bg-gray-100 font-bold">
+                </div>
+                
+                <div class="md:col-span-2 border-t pt-4">
+                    <h3 class="font-bold text-gray-800 mb-3">Bank Details</h3>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Bank Account Number</label>
+                    <input type="text" name="bank_account" value="${employee.bank_account || ''}" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Bank IFSC Code</label>
+                    <input type="text" name="bank_ifsc" value="${employee.bank_ifsc || ''}" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+            </div>
+            
+            <div class="flex justify-end space-x-4 mt-6">
+                <button type="button" onclick="closeModal()" class="px-6 py-2 border rounded-lg hover:bg-gray-50 transition duration-200">
+                    Cancel
+                </button>
+                <button type="submit" class="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 transition duration-200">
+                    <i class="fas fa-save mr-2"></i>Update Employee
+                </button>
+            </div>
+        </form>
+    `;
+    
+    showModal('Edit Employee', formHtml, 'max-w-3xl');
+    
+    // Initialize gross salary
+    setTimeout(() => calculateEditGrossSalary(), 100);
+    
+    document.getElementById('editEmployeeForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const formData = new FormData(e.target);
+        
+        const updateData = {
+            full_name: formData.get('full_name'),
+            designation: formData.get('designation'),
+            phone: formData.get('phone'),
+            email: formData.get('email') || '',
+            address: formData.get('address'),
+            basic_salary: parseFloat(formData.get('basic_salary')),
+            hra: parseFloat(formData.get('hra')) || 0,
+            bank_account: formData.get('bank_account') || '',
+            bank_ifsc: formData.get('bank_ifsc') || ''
+        };
+        
+        try {
+            await API.patch('employees', empId, updateData);
+            Utils.showNotification('Employee updated successfully', 'success');
+            closeModal();
+            loadPage('payroll-employees');
+        } catch (error) {
+            Utils.showNotification('Error updating employee', 'error');
+        }
     });
+}
 
-    await SSIApp.saveState(st);
-    SSIApp.toast(`✅ Generated ${generated} payroll records${skipped?' ('+skipped+' PAID skipped)':''}`);
-    SSIApp.audit('PAYROLL_GENERATE', `Generated ${generated} records for ${month}`);
-    SSIApp.closeModal();
+function calculateEditGrossSalary() {
+    const basic = parseFloat(document.getElementById('editBasicSalary').value) || 0;
+    const hra = parseFloat(document.getElementById('editHRA').value) || 0;
+    document.getElementById('editGrossSalary').value = (basic + hra).toFixed(2);
+}
 
-    // Set filter to the generated month
-    const sel = document.getElementById('pr-filter-period');
-    if (sel) {
-      const opt = [...sel.options].find(o=>o.value===month);
-      if (!opt) { const o=document.createElement('option'); o.value=month; o.textContent=_fmtPeriod(month); sel.insertBefore(o, sel.options[1]); }
-      sel.value = month;
-    }
-    applyFilter();
-  }
+// ========================================
+// ATTENDANCE MANAGEMENT
+// ========================================
 
-  /* ── Edit record (deductions / remarks) ─────────────────── */
-  function openEdit(recId) {
-    const st  = SSIApp.getState();
-    const rec = (st.payroll||[]).find(p=>p.id===recId);
-    if (!rec) return;
-    const emp  = _findEmp(st, rec);
-
-    SSIApp.modal(`
-      <h3 style="margin-bottom:14px;">✏️ Edit Payroll — ${emp?.name||rec.emp_name||''} (${_fmtPeriod(rec.period)})</h3>
-      <div style="background:#f8fafc;border-radius:8px;padding:12px;margin-bottom:14px;font-size:13px;display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-        <div>Gross Pay: <b>₹${_fmt(rec.gross_pay)}</b></div>
-        <div>OT Amount: <b>₹${_fmt(rec.ot_amount)}</b></div>
-        <div>Present: <b>${rec.present_days}</b> days</div>
-        <div>Working Days: <b>${rec.working_days}</b> days</div>
-      </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
-        <div>
-          <label>💰 Advance / Loan Recovery (₹)</label>
-          <input type="number" id="edit-advance" value="${rec.advance||0}" min="0" oninput="SSIPayroll._calcNet()">
+async function loadAttendanceManagement(content, user) {
+    const currentDate = new Date();
+    const currentMonth = currentDate.getMonth() + 1;
+    const currentYear = currentDate.getFullYear();
+    
+    // Get attendance records
+    const allAttendance = await API.getAll('attendance');
+    const holidays = await API.getAll('holidays');
+    
+    content.innerHTML = `
+        <div class="mb-6 flex justify-between items-center">
+            <div>
+                <h1 class="text-3xl font-bold text-gray-800">Attendance Management</h1>
+                <p class="text-gray-600">Track monthly attendance, leaves, and overtime</p>
+            </div>
+            <div class="flex space-x-2">
+                <button onclick="showHolidayCalendar()" class="bg-purple-600 text-white px-6 py-3 rounded-lg hover:bg-purple-700 transition duration-200">
+                    <i class="fas fa-calendar-alt mr-2"></i>Holiday Calendar
+                </button>
+                <button onclick="showBulkAttendanceUpload()" class="bg-green-600 text-white px-6 py-3 rounded-lg hover:bg-green-700 transition duration-200">
+                    <i class="fas fa-upload mr-2"></i>Bulk Upload
+                </button>
+                <button onclick="showAttendanceEntryModal()" class="bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700 transition duration-200">
+                    <i class="fas fa-plus mr-2"></i>Add Attendance
+                </button>
+            </div>
         </div>
-        <div>
-          <label>📌 EPF (12% of Basic) <span style="font-size:10px;color:#64748b;">auto</span></label>
-          <input type="number" id="edit-epf" value="${rec.epf_amount||0}" min="0" step="0.01" oninput="SSIPayroll._calcNet()">
+        
+        <!-- Month/Year Selector -->
+        <div class="bg-white rounded-lg shadow p-4 mb-6">
+            <div class="flex items-center space-x-4">
+                <label class="font-medium text-gray-700">Select Month:</label>
+                <select id="attendanceMonth" onchange="filterAttendanceByMonth()" class="px-4 py-2 border rounded-lg">
+                    ${[1,2,3,4,5,6,7,8,9,10,11,12].map(m => `
+                        <option value="${m}" ${m === currentMonth ? 'selected' : ''}>
+                            ${new Date(2024, m-1).toLocaleString('default', { month: 'long' })}
+                        </option>
+                    `).join('')}
+                </select>
+                <select id="attendanceYear" onchange="filterAttendanceByMonth()" class="px-4 py-2 border rounded-lg">
+                    ${[2023, 2024, 2025, 2026].map(y => `
+                        <option value="${y}" ${y === currentYear ? 'selected' : ''}>${y}</option>
+                    `).join('')}
+                </select>
+                <button onclick="loadAttendanceStats()" class="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700">
+                    <i class="fas fa-sync mr-2"></i>Refresh
+                </button>
+            </div>
         </div>
-        <div>
-          <label>🏥 ESI (0.75% if ≤₹21K) <span style="font-size:10px;color:#64748b;">auto</span></label>
-          <input type="number" id="edit-esi" value="${rec.esi_amount||0}" min="0" step="0.01" oninput="SSIPayroll._calcNet()">
+        
+        <!-- Stats -->
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-6" id="attendanceStats">
+            <!-- Stats will be loaded dynamically -->
         </div>
-        <div>
-          <label>📝 Deduction Note</label>
-          <input id="edit-deduct-note" value="${rec.deduction_note||''}" placeholder="e.g. Advance recovery">
+        
+        <!-- Attendance Records -->
+        <div class="bg-white rounded-lg shadow overflow-hidden">
+            <div class="p-4 border-b">
+                <input type="text" id="attendanceSearch" placeholder="Search by employee name or ID..." 
+                    class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    onkeyup="searchAttendance()">
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full" id="attendanceTable">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="text-left py-3 px-4">Emp ID</th>
+                            <th class="text-left py-3 px-4">Employee Name</th>
+                            <th class="text-left py-3 px-4">Month/Year</th>
+                            <th class="text-left py-3 px-4">Present</th>
+                            <th class="text-left py-3 px-4">Absent</th>
+                            <th class="text-left py-3 px-4">Paid Leaves</th>
+                            <th class="text-left py-3 px-4">Unpaid Leaves</th>
+                            <th class="text-left py-3 px-4">Overtime (hrs)</th>
+                            <th class="text-left py-3 px-4">Payable Days</th>
+                            <th class="text-left py-3 px-4">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="attendanceTableBody">
+                        <!-- Will be loaded dynamically -->
+                    </tbody>
+                </table>
+            </div>
         </div>
-        <div>
-          <label>Payment Mode</label>
-          <select id="edit-pay-mode">
-            <option value="">Select</option>
-            <option value="CASH"   ${rec.payment_mode==='CASH'?'selected':''}>💵 Cash</option>
-            <option value="BANK"   ${rec.payment_mode==='BANK'?'selected':''}>🏦 Bank Transfer</option>
-            <option value="CHEQUE" ${rec.payment_mode==='CHEQUE'?'selected':''}>📄 Cheque</option>
-          </select>
-        </div>
-        <div>
-          <label>Remarks</label>
-          <input id="edit-remarks" value="${rec.remarks||''}" placeholder="Any note…">
-        </div>
-      </div>
-      <div style="background:#FDECEA;border-radius:8px;padding:12px;margin-top:14px;text-align:center;">
-        <span style="font-size:13px;">Revised Net Pay: </span>
-        <span id="edit-net-preview" data-gross="${rec.gross_pay}" style="font-size:20px;font-weight:800;color:#922B21;">₹${_fmt(rec.net_pay||rec.gross_pay)}</span>
-      </div>
-      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;">
-        <button class="btn btn-secondary" onclick="SSIApp.closeModal()">Cancel</button>
-        <button class="btn btn-primary" onclick="SSIPayroll.saveEdit('${recId}')">💾 Save</button>
-      </div>`);
-  }
+    `;
+    
+    window.allAttendance = allAttendance;
+    window.allHolidays = holidays;
+    await loadAttendanceStats();
+}
 
-  function _calcNet() {
-    const adv = parseFloat(document.getElementById('edit-advance')?.value)||0;
-    const epf = parseFloat(document.getElementById('edit-epf')?.value)||0;
-    const esi = parseFloat(document.getElementById('edit-esi')?.value)||0;
-    const gross = parseFloat(document.getElementById('edit-net-preview')?.dataset?.gross || 0);
-    const n = Math.max(0, gross - adv - epf - esi);
-    const el = document.getElementById('edit-net-preview');
-    if (el) { el.textContent = '₹' + n.toLocaleString('en-IN',{maximumFractionDigits:2}); }
-  }
-
-  async function saveEdit(recId) {
-    const st  = SSIApp.getState();
-    const idx = (st.payroll||[]).findIndex(p=>p.id===recId);
-    if (idx<0) return;
-    const rec     = st.payroll[idx];
-    const advance = Math.max(0, parseFloat(document.getElementById('edit-advance')?.value)||0);
-    const epf     = Math.max(0, parseFloat(document.getElementById('edit-epf')?.value)||0);
-    const esi     = Math.max(0, parseFloat(document.getElementById('edit-esi')?.value)||0);
-    const totalD  = Math.round((advance + epf + esi)*100)/100;
-    const netPay  = Math.max(0, Math.round((rec.gross_pay - totalD)*100)/100);
-
-    st.payroll[idx] = {
-      ...rec,
-      advance,
-      epf_amount:     epf,
-      esi_amount:     esi,
-      deductions:     totalD,
-      deduction_note: document.getElementById('edit-deduct-note')?.value.trim()||'',
-      payment_mode:   document.getElementById('edit-pay-mode')?.value||'',
-      remarks:        document.getElementById('edit-remarks')?.value.trim()||'',
-      net_pay:        netPay,
-      status:         rec.status === 'DRAFT' ? 'PROCESSED' : rec.status,
-      updated_at:     new Date().toISOString(),
-    };
-    await SSIApp.saveState(st);
-    SSIApp.toast('✅ Payroll record updated');
-    SSIApp.closeModal();
-    applyFilter();
-  }
-
-  /* ── Mark as Paid ────────────────────────────────────────── */
-  async function markPaid(recId) {
-    const st  = SSIApp.getState();
-    const idx = (st.payroll||[]).findIndex(p=>p.id===recId);
-    if (idx<0) return;
-    const ok  = await SSIApp.confirm(`Mark this payroll as PAID?\nPayment date: ${new Date().toLocaleDateString('en-IN')}\nThis cannot be undone.`);
-    if (!ok) return;
-    st.payroll[idx] = { ...st.payroll[idx], status:'PAID', payment_date: new Date().toISOString().slice(0,10) };
-    await SSIApp.saveState(st);
-    SSIApp.audit('PAYROLL_PAID', `Marked paid: ${st.payroll[idx].emp_id} period ${st.payroll[idx].period}`);
-    SSIApp.toast('✅ Marked as Paid');
-    applyFilter();
-  }
-
-  /* ── Print Salary Slip ───────────────────────────────────── */
-  function printSlip(recId) {
-    const st  = SSIApp.getState();
-    const rec = (st.payroll||[]).find(p=>p.id===recId);
-    if (!rec) return;
-    const emp  = _findEmp(st, rec);
-    const { name: _n, code: _c, type: _t, unit: _u } = _empDisplay(emp, rec);
-    const perDay = ((rec.monthly_salary||0)/(rec.working_days||30)).toFixed(2);
-
-    const slip = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Salary Slip</title>
-    <style>
-      body{font-family:Arial,sans-serif;font-size:13px;color:#111;max-width:700px;margin:20px auto;}
-      h2{text-align:center;margin-bottom:4px;color:#922B21;}
-      .sub{text-align:center;color:#64748b;margin-bottom:16px;font-size:12px;}
-      table{width:100%;border-collapse:collapse;margin-bottom:12px;}
-      td,th{padding:7px 10px;border:1px solid #e2e8f0;font-size:13px;}
-      th{background:#FDECEA;color:#922B21;font-weight:700;}
-      .row-label{background:#f8fafc;font-weight:600;width:50%;}
-      .total{background:#8B1A1A;color:#fff;font-size:15px;font-weight:800;}
-      .footer{border-top:2px solid #8B1A1A;margin-top:24px;padding-top:12px;font-size:11px;color:#64748b;display:flex;justify-content:space-between;}
-      @media print{body{margin:0;}}
-    </style></head><body>
-    <h2>SSI Group — Salary Slip</h2>
-    <div class="sub">Unit: ${unit?.name||'—'} &nbsp;|&nbsp; Month: <b>${_fmtPeriod(rec.period)}</b></div>
-    <table>
-      <tr><td class="row-label">Employee Name</td><td>${_n}</td><td class="row-label">Employee Code</td><td>${_c}</td></tr>
-      <tr><td class="row-label">Designation</td><td>${emp?.designation||'—'}</td><td class="row-label">Department</td><td>${emp?.department||'—'}</td></tr>
-      <tr><td class="row-label">Category</td><td>${emp?.type||'—'}</td><td class="row-label">Bank Account</td><td>${emp?.bank_ac||'—'}</td></tr>
-    </table>
-    <table>
-      <tr><th colspan="2">📅 Attendance</th><th colspan="2">💰 Earnings</th></tr>
-      <tr><td class="row-label">Working Days (Month)</td><td>${rec.working_days}</td><td class="row-label">Monthly Salary</td><td>₹${_fmt(rec.monthly_salary)}</td></tr>
-      <tr><td class="row-label">Present Days</td><td>${rec.present_days}</td><td class="row-label">Per Day Rate</td><td>₹${perDay}</td></tr>
-      <tr><td class="row-label">Half Days</td><td>${rec.half_days}</td><td class="row-label">Basic Earnings</td><td>₹${_fmt(rec.gross_pay - rec.ot_amount)}</td></tr>
-      <tr><td class="row-label">Leaves Taken</td><td>${rec.leave_days}</td><td class="row-label">OT Hours</td><td>${rec.ot_hours} hrs</td></tr>
-      <tr><td class="row-label">Paid Leaves</td><td>${rec.paid_leaves}</td><td class="row-label">OT Amount (₹${(rec.ot_rate||0).toFixed(2)}/hr)</td><td>₹${_fmt(rec.ot_amount)}</td></tr>
-      <tr><td class="row-label">Absent Days</td><td>${rec.absent_days}</td><td class="row-label">Gross Pay</td><td><b>₹${_fmt(rec.gross_pay)}</b></td></tr>
-    </table>
-    <table>
-      <tr><th colspan="2">📉 Deductions</th></tr>
-      <tr><td class="row-label">💰 Advance / Loan Recovery</td><td>₹${_fmt(rec.advance||0)} ${rec.deduction_note?'('+rec.deduction_note+')':''}</td></tr>
-      <tr><td class="row-label">📌 EPF (Employer 12%)</td><td>₹${_fmt(rec.epf_amount||0)}</td></tr>
-      <tr><td class="row-label">🏥 ESI (Employee 0.75%)</td><td>₹${_fmt(rec.esi_amount||0)}${(rec.gross_pay||0)>21000?' <span style="font-size:10px;color:#94a3b8;">(N/A: Gross > ₹21,000)</span>':''}</td></tr>
-      <tr><td class="row-label"><b>Total Deductions</b></td><td><b>₹${_fmt(rec.deductions||0)}</b></td></tr>
-    </table>
-    <table>
-      <tr class="total"><td>NET PAY</td><td style="text-align:right;font-size:18px;">₹${_fmt(rec.net_pay)}</td></tr>
-    </table>
-    ${rec.payment_mode ? `<p style="font-size:12px;color:#64748b;">Payment Mode: ${rec.payment_mode} ${rec.payment_date?'| Date: '+rec.payment_date:''}</p>` : ''}
-    <div class="footer">
-      <span>Generated: ${new Date().toLocaleString('en-IN')}</span>
-      <span>Status: ${rec.status}</span>
-      <span>Authorised Signatory</span>
-    </div>
-    <script>window.onload=()=>window.print();<\/script>
-    </body></html>`;
-
-    const w = window.open('', '_blank');
-    if (w) { w.document.write(slip); w.document.close(); }
-  }
-
-  /* ── Delete payroll record (ADMIN only, DRAFT/PROCESSED only) ── */
-  async function deletePayroll(recId) {
-    if (!SSIApp.hasRole('ADMIN')) { SSIApp.toast('🔒 Admin only'); return; }
-    const st  = SSIApp.getState();
-    const rec = (st.payroll||[]).find(p=>p.id===recId);
-    if (!rec) return;
-    if (rec.status === 'PAID') { SSIApp.toast('❌ Cannot delete a PAID payroll record'); return; }
-    const emp = _findEmp(st, rec);
-    const ok  = await SSIApp.confirm(`Delete payroll for ${emp?.name||rec.emp_name||'this employee'} (${_fmtPeriod(rec.period)})? This cannot be undone.`);
-    if (!ok) return;
-    st.payroll = st.payroll.filter(p=>p.id!==recId);
-    await SSIApp.saveState(st);
-    SSIApp.audit('PAYROLL_DELETE', `Deleted payroll: ${rec.emp_id} period ${rec.period}`);
-    SSIApp.toast('🗑️ Payroll record deleted');
-    applyFilter();
-  }
-
-  /* ── Export ──────────────────────────────────────────────── */
-  function exportExcel() {
-    const st      = SSIApp.getState();
-    const isAdmin = SSIApp.hasRole('ADMIN');
-    const period  = document.getElementById('pr-filter-period')?.value || '';
-    let list      = (st.payroll||[]).filter(p => {
-      const emp = _findEmp(st, p);
-      if (!isAdmin && emp?.type==='STAFF') return false;
-      if (period && p.period!==period) return false;
-      return true;
+async function loadAttendanceStats() {
+    const month = parseInt(document.getElementById('attendanceMonth').value);
+    const year = parseInt(document.getElementById('attendanceYear').value);
+    
+    const allAttendance = await API.getAll('attendance');
+    const employees = await API.getAll('employees');
+    
+    // Filter for selected month
+    const monthAttendance = allAttendance.filter(a => {
+        const monthStr = `${year}-${String(month).padStart(2, '0')}`;
+        return a.month === monthStr && a.year === year;
     });
+    
+    const totalRecords = monthAttendance.length;
+    const totalPresent = monthAttendance.reduce((sum, a) => sum + a.days_present, 0);
+    const totalAbsent = monthAttendance.reduce((sum, a) => sum + a.days_absent, 0);
+    const totalOvertime = monthAttendance.reduce((sum, a) => sum + (a.overtime_hours || 0), 0);
+    
+    document.getElementById('attendanceStats').innerHTML = `
+        <div class="bg-white rounded-lg shadow p-6">
+            <div class="flex items-center justify-between">
+                <div>
+                    <p class="text-gray-500 text-sm font-medium">Records</p>
+                    <p class="text-3xl font-bold text-gray-800 mt-2">${totalRecords}</p>
+                </div>
+                <div class="bg-blue-100 p-3 rounded-full">
+                    <i class="fas fa-file-alt text-2xl text-blue-600"></i>
+                </div>
+            </div>
+        </div>
+        <div class="bg-white rounded-lg shadow p-6">
+            <div class="flex items-center justify-between">
+                <div>
+                    <p class="text-gray-500 text-sm font-medium">Total Present Days</p>
+                    <p class="text-3xl font-bold text-green-600 mt-2">${totalPresent}</p>
+                </div>
+                <div class="bg-green-100 p-3 rounded-full">
+                    <i class="fas fa-check-circle text-2xl text-green-600"></i>
+                </div>
+            </div>
+        </div>
+        <div class="bg-white rounded-lg shadow p-6">
+            <div class="flex items-center justify-between">
+                <div>
+                    <p class="text-gray-500 text-sm font-medium">Total Absent Days</p>
+                    <p class="text-3xl font-bold text-red-600 mt-2">${totalAbsent}</p>
+                </div>
+                <div class="bg-red-100 p-3 rounded-full">
+                    <i class="fas fa-times-circle text-2xl text-red-600"></i>
+                </div>
+            </div>
+        </div>
+        <div class="bg-white rounded-lg shadow p-6">
+            <div class="flex items-center justify-between">
+                <div>
+                    <p class="text-gray-500 text-sm font-medium">Total Overtime</p>
+                    <p class="text-3xl font-bold text-purple-600 mt-2">${totalOvertime.toFixed(1)} hrs</p>
+                </div>
+                <div class="bg-purple-100 p-3 rounded-full">
+                    <i class="fas fa-clock text-2xl text-purple-600"></i>
+                </div>
+            </div>
+        </div>
+    `;
+    
+    await renderAttendanceTable(monthAttendance, employees);
+}
 
-    const headers = ['Period','Emp Code','Name','Type','Unit','Monthly Sal','Days Present','Half Days','Leaves','Paid Leaves','OT Hrs','OT Amt','Deductions','Gross Pay','Net Pay','Status','Payment Mode','Payment Date','Remarks'];
-    const rows = [headers];
-    list.forEach(p => {
-      const emp  = _findEmp(st, p);
-      const unit = (st.units||[]).find(u=>u.id===emp?.unit_id);
-      rows.push([
-        p.period, emp?.emp_code||p.emp_code||'', emp?.name||p.emp_name||'', emp?.type||p.emp_type||'', unit?.name||p.unit_name||'',
-        p.monthly_salary, p.present_days, p.half_days, p.leave_days, p.paid_leaves,
-        p.ot_hours, p.ot_amount, p.deductions, p.gross_pay, p.net_pay,
-        p.status, p.payment_mode||'', p.payment_date||'', p.remarks||''
-      ]);
-    });
-    SSIApp.excelDownload(rows, 'Payroll', `SSI_Payroll_${period||'All'}`);
-  }
-
-  /* ── Helpers ─────────────────────────────────────────────── */
-  function _fmt(n) {
-    return (n||0).toLocaleString('en-IN', {minimumFractionDigits:0, maximumFractionDigits:2});
-  }
-  function _fmtPeriod(ym) {
-    if (!ym) return '';
-    const [y,m] = ym.split('-');
-    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    return `${months[parseInt(m)-1]} ${y}`;
-  }
-  function _statusBadge(s) {
-    const map = {
-      DRAFT:     {bg:'#f3f4f6',c:'#6b7280',l:'📝 Draft'},
-      PROCESSED: {bg:'#fef3c7',c:'#92400e',l:'🔄 Processed'},
-      PAID:      {bg:'#dcfce7',c:'#166534',l:'✅ Paid'},
-    };
-    const v = map[s]||{bg:'#f3f4f6',c:'#6b7280',l:s};
-    return `<span style="background:${v.bg};color:${v.c};padding:3px 8px;border-radius:12px;font-size:11px;font-weight:600;">${v.l}</span>`;
-  }
-
-
-  /* ── Re-link Orphaned Payroll Records ───────────────────────
-     When employees are deleted+reimported, payroll emp_ids break.
-     This modal lets admin manually map each orphaned emp_id to
-     the correct current employee.                              */
-  function openRelinkModal() {
-    if (!SSIApp.hasRole('ADMIN')) return;
-    const st   = SSIApp.getState();
-    const emps = (st.employees||[]).filter(e=>e.active!==false);
-
-    // Find unique orphaned emp_ids (not found by any lookup tier)
-    const orphanGroups = {};
-    (st.payroll||[]).forEach(p => {
-      if (_findEmp(st, p)) return; // already linked — skip
-      if (!orphanGroups[p.emp_id]) {
-        orphanGroups[p.emp_id] = { salary: p.monthly_salary, count: 0, ids: [] };
-      }
-      orphanGroups[p.emp_id].count++;
-      orphanGroups[p.emp_id].ids.push(p.id);
-    });
-
-    const orphanList = Object.entries(orphanGroups);
-    if (!orphanList.length) {
-      SSIApp.toast('✅ No orphaned records — all payroll records are properly linked!');
-      return;
-    }
-
-    const empOptions = emps.map(e =>
-      `<option value="${e.id}">${e.emp_code} – ${e.name} (${e.type})</option>`
-    ).join('');
-
-    const rows = orphanList.map(([oldId, info], i) => `
-      <tr style="border-bottom:1px solid #e2e8f0;">
-        <td style="padding:10px 8px;font-size:12px;color:#64748b;">${info.count} record(s)<br>Salary: ₹${(info.salary||0).toLocaleString('en-IN')}</td>
-        <td style="padding:10px 8px;">
-          <select id="relink-sel-${i}" data-oldid="${oldId}" data-recids="${info.ids.join(',')}"
-            style="width:100%;padding:6px 10px;border:1.5px solid #e2e8f0;border-radius:8px;font-size:13px;">
-            <option value="">— Select Employee —</option>
-            ${empOptions}
-          </select>
-        </td>
-      </tr>`).join('');
-
-    SSIApp.modal(`
-      <div style="padding:4px;">
-        <h3 style="margin-bottom:4px;font-size:17px;font-weight:700;">🔗 Re-link Payroll Records</h3>
-        <p style="color:#64748b;font-size:13px;margin-bottom:16px;">
-          ${orphanList.length} group(s) of payroll records have no linked employee 
-          (employees were deleted &amp; re-imported with new IDs).<br>
-          Match each group to the correct employee below.
-        </p>
-        <table style="width:100%;border-collapse:collapse;">
-          <thead>
-            <tr style="background:#f8fafc;">
-              <th style="padding:8px;text-align:left;font-size:12px;color:#64748b;font-weight:600;">Payroll Records</th>
-              <th style="padding:8px;text-align:left;font-size:12px;color:#64748b;font-weight:600;">Assign to Employee</th>
+async function renderAttendanceTable(attendanceRecords, employees) {
+    const tbody = document.getElementById('attendanceTableBody');
+    
+    if (attendanceRecords.length === 0) {
+        tbody.innerHTML = `
+            <tr>
+                <td colspan="10" class="py-8 text-center text-gray-500">
+                    <i class="fas fa-calendar-times text-4xl mb-2"></i>
+                    <p>No attendance records for this month</p>
+                </td>
             </tr>
-          </thead>
-          <tbody>${rows}</tbody>
-        </table>
-        <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:20px;">
-          <button class="btn btn-secondary" onclick="SSIApp.closeModal()">Cancel</button>
-          <button class="btn btn-primary" onclick="SSIPayroll.saveRelink()">✅ Save Links</button>
-        </div>
-      </div>
-    `);
-  }
+        `;
+        return;
+    }
+    
+    tbody.innerHTML = attendanceRecords.map(att => {
+        return `
+            <tr class="border-b hover:bg-gray-50" data-empname="${att.employee_name.toLowerCase()}">
+                <td class="py-3 px-4 font-bold">${att.emp_id}</td>
+                <td class="py-3 px-4">${att.employee_name}</td>
+                <td class="py-3 px-4">${att.month}</td>
+                <td class="py-3 px-4 text-green-600 font-bold">${att.days_present}</td>
+                <td class="py-3 px-4 text-red-600 font-bold">${att.days_absent}</td>
+                <td class="py-3 px-4">${att.paid_leaves}</td>
+                <td class="py-3 px-4">${att.unpaid_leaves}</td>
+                <td class="py-3 px-4 ${att.overtime_hours > 0 ? 'text-purple-600 font-bold' : ''}">${att.overtime_hours || 0}</td>
+                <td class="py-3 px-4 font-bold text-blue-600">${att.total_payable_days}</td>
+                <td class="py-3 px-4">
+                    <button onclick="editAttendance('${att.id}')" class="text-blue-600 hover:text-blue-800 mr-2" title="Edit">
+                        <i class="fas fa-edit"></i>
+                    </button>
+                    <button onclick="deleteAttendance('${att.id}')" class="text-red-600 hover:text-red-800" title="Delete">
+                        <i class="fas fa-trash"></i>
+                    </button>
+                </td>
+            </tr>
+        `;
+    }).join('');
+}
 
-  async function saveRelink() {
-    const st   = SSIApp.getState();
-    const emps = st.employees || [];
-    let linked = 0;
-
-    // Collect all select elements with data-oldid
-    document.querySelectorAll('[data-oldid]').forEach(sel => {
-      const newEmpId = sel.value;
-      if (!newEmpId) return;
-      const emp  = emps.find(e => e.id === newEmpId);
-      if (!emp) return;
-      const unit = (st.units||[]).find(u => u.id === emp.unit_id);
-      const recIds = (sel.dataset.recids || '').split(',').filter(Boolean);
-
-      recIds.forEach(rid => {
-        const rec = (st.payroll||[]).find(p => p.id === rid);
-        if (!rec) return;
-        rec.emp_id    = emp.id;
-        rec.emp_name  = emp.name || '';
-        rec.emp_code  = emp.emp_code || '';
-        rec.emp_type  = emp.type || '';
-        rec.unit_name = unit?.name || '';
-        linked++;
-      });
+async function showAttendanceEntryModal() {
+    const employees = await API.getAll('employees');
+    const activeEmployees = employees.filter(e => e.is_active);
+    
+    const formHtml = `
+        <form id="attendanceForm" class="space-y-4">
+            <div class="bg-blue-50 p-4 rounded-lg mb-4">
+                <p class="text-sm text-blue-800"><i class="fas fa-info-circle mr-2"></i>
+                Payable Days = Present Days + Paid Leaves (calculated automatically)</p>
+            </div>
+            
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Employee *</label>
+                    <select name="employee_id" id="attEmployeeSelect" required onchange="updateLeaveFields()" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        <option value="">Select Employee</option>
+                        ${activeEmployees.map(emp => `
+                            <option value="${emp.id}" data-type="${emp.employee_type}" data-overtime="${emp.overtime_eligible}">
+                                ${emp.emp_id} - ${emp.full_name} (${emp.employee_type})
+                            </option>
+                        `).join('')}
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Month/Year *</label>
+                    <input type="month" name="month_year" required class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Days Present *</label>
+                    <input type="number" name="days_present" id="daysPresent" required min="0" max="31" onchange="calculatePayableDays()" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Days Absent *</label>
+                    <input type="number" name="days_absent" required min="0" max="31" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Paid Leaves</label>
+                    <input type="number" name="paid_leaves" id="paidLeaves" min="0" max="10" value="0" onchange="calculatePayableDays()" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    <p class="text-xs text-gray-500 mt-1" id="leavesHint">Staff: 2 free leaves/month</p>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Unpaid Leaves</label>
+                    <input type="number" name="unpaid_leaves" min="0" max="31" value="0" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <div id="overtimeField" style="display:none;">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Overtime Hours</label>
+                    <input type="number" name="overtime_hours" min="0" step="0.5" value="0" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    <p class="text-xs text-gray-500 mt-1">For workers only</p>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Payable Days (Auto) *</label>
+                    <input type="number" name="payable_days" id="payableDays" readonly class="w-full px-4 py-2 border rounded-lg bg-gray-100 font-bold">
+                </div>
+            </div>
+            
+            <div class="flex justify-end space-x-4 mt-6">
+                <button type="button" onclick="closeModal()" class="px-6 py-2 border rounded-lg hover:bg-gray-50 transition duration-200">
+                    Cancel
+                </button>
+                <button type="submit" class="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 transition duration-200">
+                    <i class="fas fa-save mr-2"></i>Save Attendance
+                </button>
+            </div>
+        </form>
+    `;
+    
+    showModal('Add Attendance Record', formHtml, 'max-w-3xl');
+    
+    document.getElementById('attendanceForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const formData = new FormData(e.target);
+        
+        // Get employee details
+        const employeeId = formData.get('employee_id');
+        const employees = await API.getAll('employees');
+        const employee = employees.find(emp => emp.id === employeeId);
+        
+        if (!employee) {
+            Utils.showNotification('Employee not found', 'error');
+            return;
+        }
+        
+        const monthYear = formData.get('month_year');
+        const year = parseInt(monthYear.split('-')[0]);
+        
+        const attendanceData = {
+            id: Utils.generateId('att'),
+            emp_id: employee.emp_id,
+            employee_name: employee.full_name,
+            month: monthYear,
+            year: year,
+            days_present: parseInt(formData.get('days_present')),
+            days_absent: parseInt(formData.get('days_absent')),
+            sundays_holidays: 4,
+            paid_leaves: parseInt(formData.get('paid_leaves')) || 0,
+            unpaid_leaves: parseInt(formData.get('unpaid_leaves')) || 0,
+            overtime_hours: parseFloat(formData.get('overtime_hours')) || 0,
+            total_payable_days: parseInt(formData.get('payable_days'))
+        };
+        
+        try {
+            await API.create('attendance', attendanceData);
+            Utils.showNotification('Attendance record saved successfully', 'success');
+            closeModal();
+            loadPage('payroll-attendance');
+        } catch (error) {
+            Utils.showNotification('Error saving attendance: ' + error.message, 'error');
+        }
     });
+}
 
-    if (!linked) { SSIApp.toast('⚠️ No employees selected — nothing saved'); return; }
+function updateLeaveFields() {
+    const select = document.getElementById('attEmployeeSelect');
+    const selectedOption = select.options[select.selectedIndex];
+    const empType = selectedOption.dataset.type;
+    const overtimeEligible = selectedOption.dataset.overtime === 'true';
+    
+    const overtimeField = document.getElementById('overtimeField');
+    if (overtimeEligible && empType === 'Worker') {
+        overtimeField.style.display = 'block';
+    } else {
+        overtimeField.style.display = 'none';
+    }
+}
 
-    await SSIApp.saveState(st);
-    SSIApp.closeModal();
-    SSIApp.toast(`✅ Re-linked ${linked} payroll record(s) successfully`);
-    SSIApp.audit('PAYROLL_RELINK', `Re-linked ${linked} orphaned payroll records`);
-    applyFilter();
-  }
+function calculatePayableDays() {
+    const present = parseInt(document.getElementById('daysPresent').value) || 0;
+    const paidLeaves = parseInt(document.getElementById('paidLeaves').value) || 0;
+    document.getElementById('payableDays').value = present + paidLeaves;
+}
 
-  return {
-    render, refresh, applyFilter,
-    openGenerateModal, runGenerate,
-    openEdit, saveEdit, _calcNet, deletePayroll, markPaid,
-    printSlip, exportExcel,
-    openRelinkModal, saveRelink
-  };
-})();
+function filterAttendanceByMonth() {
+    loadAttendanceStats();
+}
+
+function searchAttendance() {
+    const searchTerm = document.getElementById('attendanceSearch').value.toLowerCase();
+    const rows = document.querySelectorAll('#attendanceTable tbody tr');
+    
+    rows.forEach(row => {
+        const text = row.textContent.toLowerCase();
+        row.style.display = text.includes(searchTerm) ? '' : 'none';
+    });
+}
+
+async function showHolidayCalendar() {
+    const holidays = await API.getAll('holidays');
+    const currentYear = new Date().getFullYear();
+    
+    const formHtml = `
+        <div class="space-y-4">
+            <div class="bg-blue-50 p-4 rounded-lg mb-4">
+                <p class="text-sm text-blue-800"><i class="fas fa-info-circle mr-2"></i>
+                Sundays are automatically excluded. Add other holidays here.</p>
+            </div>
+            
+            <div class="mb-4">
+                <button onclick="showAddHolidayForm()" class="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700">
+                    <i class="fas fa-plus mr-2"></i>Add Holiday
+                </button>
+            </div>
+            
+            <div class="overflow-x-auto">
+                <table class="w-full">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="text-left py-3 px-4">Date</th>
+                            <th class="text-left py-3 px-4">Holiday Name</th>
+                            <th class="text-left py-3 px-4">Type</th>
+                            <th class="text-left py-3 px-4">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${holidays.length === 0 ? `
+                            <tr>
+                                <td colspan="4" class="py-8 text-center text-gray-500">No holidays added</td>
+                            </tr>
+                        ` : holidays.map(h => `
+                            <tr class="border-b hover:bg-gray-50">
+                                <td class="py-3 px-4">${Utils.formatDate(h.holiday_date)}</td>
+                                <td class="py-3 px-4 font-medium">${h.holiday_name}</td>
+                                <td class="py-3 px-4">
+                                    <span class="px-2 py-1 rounded-full text-xs bg-purple-100 text-purple-800">
+                                        ${h.holiday_type}
+                                    </span>
+                                </td>
+                                <td class="py-3 px-4">
+                                    <button onclick="deleteHoliday('${h.id}')" class="text-red-600 hover:text-red-800">
+                                        <i class="fas fa-trash"></i>
+                                    </button>
+                                </td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    `;
+    
+    showModal('Holiday Calendar', formHtml, 'max-w-3xl');
+}
+
+async function showAddHolidayForm() {
+    closeModal();
+    
+    const formHtml = `
+        <form id="holidayForm" class="space-y-4">
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">Holiday Date *</label>
+                <input type="date" name="holiday_date" required class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">Holiday Name *</label>
+                <input type="text" name="holiday_name" required placeholder="e.g., Diwali, Republic Day" class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">Type *</label>
+                <select name="holiday_type" required class="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    <option value="National">National Holiday</option>
+                    <option value="Festival">Festival</option>
+                    <option value="Company">Company Holiday</option>
+                </select>
+            </div>
+            
+            <div class="flex justify-end space-x-4 mt-6">
+                <button type="button" onclick="closeModal(); showHolidayCalendar();" class="px-6 py-2 border rounded-lg hover:bg-gray-50 transition duration-200">
+                    Back
+                </button>
+                <button type="submit" class="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 transition duration-200">
+                    <i class="fas fa-save mr-2"></i>Save Holiday
+                </button>
+            </div>
+        </form>
+    `;
+    
+    showModal('Add Holiday', formHtml);
+    
+    document.getElementById('holidayForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const formData = new FormData(e.target);
+        
+        const holidayData = {
+            id: Utils.generateId('hol'),
+            holiday_date: formData.get('holiday_date'),
+            holiday_name: formData.get('holiday_name'),
+            holiday_type: formData.get('holiday_type'),
+            is_active: true
+        };
+        
+        try {
+            await API.create('holidays', holidayData);
+            Utils.showNotification('Holiday added successfully', 'success');
+            closeModal();
+            showHolidayCalendar();
+        } catch (error) {
+            Utils.showNotification('Error adding holiday', 'error');
+        }
+    });
+}
+
+async function deleteHoliday(holidayId) {
+    if (!confirm('Delete this holiday?')) return;
+    
+    try {
+        await API.delete('holidays', holidayId);
+        Utils.showNotification('Holiday deleted', 'success');
+        showHolidayCalendar();
+    } catch (error) {
+        Utils.showNotification('Error deleting holiday', 'error');
+    }
+}
