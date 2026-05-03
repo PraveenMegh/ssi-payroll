@@ -1,65 +1,68 @@
-// Authentication Management
+// Authentication Manager using Firebase
 class AuthManager {
     constructor() {
-        this.currentUser = null;
-        this.loadSession();
+        this.currentUser = this.loadSession();
+        console.log('AuthManager initialized');
+    }
+
+    loadSession() {
+        const userStr = sessionStorage.getItem('ssi_user');
+        return userStr ? JSON.parse(userStr) : null;
+    }
+
+    saveSession(user) {
+        sessionStorage.setItem('ssi_user', JSON.stringify(user));
+        this.currentUser = user;
     }
 
     async login(username, password) {
         try {
-            // Fetch users from API
-            const response = await fetch('tables/users?limit=1000');
-            const data = await response.json();
+            console.log('Attempting login for:', username);
             
-            // Find user with matching credentials
-            const user = data.data.find(u => 
-                u.username === username && u.password === password && u.is_active === true
-            );
-            
-            if (user) {
-                // Update last login
-                await fetch(`tables/users/${user.id}`, {
-                    method: 'PATCH',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        last_login: new Date().toISOString()
-                    })
-                });
-                
-                // Store session
-                this.currentUser = user;
-                sessionStorage.setItem('ssi_user', JSON.stringify(user));
-                return { success: true, user };
-            } else {
+            // Query Firestore for user
+            const usersRef = db.collection('users');
+            const snapshot = await usersRef
+                .where('username', '==', username)
+                .where('password', '==', password)
+                .where('active', '==', true)
+                .limit(1)
+                .get();
+
+            if (snapshot.empty) {
+                console.log('No matching user found');
                 return { success: false, message: 'Invalid credentials or account inactive' };
             }
+
+            const userDoc = snapshot.docs[0];
+            const user = { id: userDoc.id, ...userDoc.data() };
+
+            // Update last login
+            await usersRef.doc(user.id).update({
+                last_login: new Date().toISOString()
+            });
+
+            this.saveSession(user);
+            console.log('Login successful:', user.name);
+            return { success: true, user };
+
         } catch (error) {
             console.error('Login error:', error);
-            return { success: false, message: 'Login failed. Please try again.' };
+            return { success: false, message: 'Login failed: ' + error.message };
         }
     }
 
     logout() {
-        this.currentUser = null;
         sessionStorage.removeItem('ssi_user');
-        window.location.reload();
-    }
-
-    loadSession() {
-        const userData = sessionStorage.getItem('ssi_user');
-        if (userData) {
-            this.currentUser = JSON.parse(userData);
-        }
+        this.currentUser = null;
+        location.reload();
     }
 
     isAuthenticated() {
         return this.currentUser !== null;
     }
 
-    hasRole(roles) {
-        if (!this.currentUser) return false;
-        if (typeof roles === 'string') roles = [roles];
-        return roles.includes(this.currentUser.role);
+    hasRole(role) {
+        return this.currentUser && this.currentUser.role === role;
     }
 
     getCurrentUser() {
@@ -67,43 +70,47 @@ class AuthManager {
     }
 }
 
-// Global auth instance
+// Global instance
 const authManager = new AuthManager();
 
 // Login form handler
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', function() {
     const loginForm = document.getElementById('loginForm');
     if (loginForm) {
-        loginForm.addEventListener('submit', async (e) => {
+        loginForm.addEventListener('submit', async function(e) {
             e.preventDefault();
             
-            const username = document.getElementById('loginUsername').value;
+            const username = document.getElementById('loginUsername').value.trim();
             const password = document.getElementById('loginPassword').value;
             const errorDiv = document.getElementById('loginError');
-            
-            errorDiv.classList.add('hidden');
-            
-            const result = await authManager.login(username, password);
-            
-            if (result.success) {
-                document.getElementById('loginScreen').classList.add('hidden');
-                document.getElementById('mainApp').classList.remove('hidden');
-                initializeApp();
-            } else {
-                errorDiv.textContent = result.message;
+
+            try {
+                const result = await authManager.login(username, password);
+                
+                if (result.success) {
+                    document.getElementById('loginScreen').classList.add('hidden');
+                    document.getElementById('mainApp').classList.remove('hidden');
+                    initializeApp();
+                } else {
+                    errorDiv.textContent = result.message;
+                    errorDiv.classList.remove('hidden');
+                }
+            } catch (error) {
+                console.error('Login error:', error);
+                errorDiv.textContent = 'An error occurred. Please try again.';
                 errorDiv.classList.remove('hidden');
             }
         });
     }
-    
-    // Check if already logged in
+
+    // Check existing session
     if (authManager.isAuthenticated()) {
         document.getElementById('loginScreen').classList.add('hidden');
         document.getElementById('mainApp').classList.remove('hidden');
-        initializeApp();
     }
 });
 
+// Logout function
 function logout() {
     authManager.logout();
 }
