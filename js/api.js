@@ -139,4 +139,23 @@ const API = {
     }
 };
 
+    },
+
+    // Get all records (alias for get with no limit)
+    async getAll(table) {
+        try {
+            const snapshot = await db.collection(table).get();
+            const data = [];
+            snapshot.forEach(doc => {
+                data.push({ id: doc.id, ...doc.data() });
+            });
+            return data;
+        } catch (error) {
+            console.error('API.getAll error:', error);
+            throw error;
+        }
+    }
+};
+
 console.log('✅ Firebase API helper loaded');
+
