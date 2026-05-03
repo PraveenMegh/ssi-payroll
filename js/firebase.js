@@ -53,16 +53,7 @@
       if (snap && snap.exists) {
         console.log('[SSI Firebase] ✅ Loaded from Firestore');
         showSyncBadge(true);
-        const fbData = snap.data();
-        
-        // MODIFICATION: Preserve attendance from localStorage if it exists
-        const localData = JSON.parse(localStorage.getItem('ssiData') || '{}');
-        if (localData.attendance && localData.attendance.length > 0) {
-            console.log('[SSI Firebase] 🛡️ Preserving local attendance:', localData.attendance.length, 'records');
-            fbData.attendance = localData.attendance;
-        }
-        
-        return fbData;
+        return snap.data();
       }
       console.warn('[SSI Firebase] No document yet — will seed defaults');
       return null;
