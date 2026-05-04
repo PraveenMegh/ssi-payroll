@@ -1,9 +1,7 @@
 // ============================================================
-//  SSI Inventory — User Management Module
+//  SSI Inventory — User Management Module (v2 SAFE)
 //  users.js  |  ADMIN access only
-// ============================================================
-//  User schema: { id, username, password, name, role, active }
-//  Roles: ADMIN | STOCK | DISPATCH | SALES | ACCOUNTANT
+//  Stage 1 Batch 2: confirmation popups + soft delete
 // ============================================================
 
 const SSIUsers = (() => {
@@ -21,157 +19,120 @@ const SSIUsers = (() => {
 
   function roleBadge(role) {
     const c = ROLE_COLORS[role] || { bg:'#f1f5f9', color:'#475569' };
-    return `<span style="background:${c.bg};color:${c.color};padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600;">${role}</span>`;
+    return `<span style="background:${c.bg};color:${c.color};padding:2px 10px;border-radius:999px;font-size:.7rem;font-weight:700;">${role}</span>`;
   }
 
   /* ── Render main users page ────────────────────────────── */
   function render(area) {
     if (!SSIApp.hasRole('ADMIN')) {
-      area.innerHTML = `<div class="card" style="text-align:center;padding:3rem;">
-        <div style="font-size:3rem;">🔒</div>
-        <h3>Access Denied</h3>
-        <p style="color:#64748b;">Only Administrators can manage users.</p>
-      </div>`;
+      area.innerHTML = `
+        <div class="empty-state">
+          <div class="icon">🔒</div>
+          <p style="color:#64748b;">Only Administrators can manage users.</p>
+        </div>`;
       return;
     }
-    area.innerHTML = `
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem;flex-wrap:wrap;gap:.5rem;">
-        <div>
-          <h2 style="margin:0;font-size:1.25rem;font-weight:700;">👤 User Management</h2>
-          <p style="margin:.25rem 0 0;font-size:.82rem;color:#64748b;">Manage login accounts and access roles</p>
-        </div>
-        <button class="btn btn-primary" onclick="SSIUsers.openForm()">+ Add User</button>
-      </div>
-
-      <div class="card" style="overflow:auto;">
-        <table style="width:100%;border-collapse:collapse;font-size:13px;">
-          <thead>
-            <tr style="background:#f8fafc;border-bottom:2px solid #e2e8f0;">
-              <th style="padding:10px 14px;text-align:left;font-weight:600;color:#475569;">#</th>
-              <th style="padding:10px 14px;text-align:left;font-weight:600;color:#475569;">Name</th>
-              <th style="padding:10px 14px;text-align:left;font-weight:600;color:#475569;">Username</th>
-              <th style="padding:10px 14px;text-align:left;font-weight:600;color:#475569;">Role</th>
-              <th style="padding:10px 14px;text-align:left;font-weight:600;color:#475569;">Status</th>
-              <th style="padding:10px 14px;text-align:right;font-weight:600;color:#475569;">Actions</th>
-            </tr>
-          </thead>
-          <tbody id="users-tbody">
-            ${buildRows()}
-          </tbody>
-        </table>
-      </div>`;
+    refresh(area);
   }
 
-  function buildRows() {
-    const st    = SSIApp.getState();
-    const users = st.users || [];
-    if (!users.length) return `<tr><td colspan="6" style="text-align:center;padding:40px;color:#94a3b8;">No users found.</td></tr>`;
+  function refresh(area) {
+    if (!area) area = document.getElementById('app-area') || document.getElementById('page-area');
+    if (!area) return;
+
+    area.innerHTML = `
+      <div class="page-header">
+        <h2 class="page-title">👤 User Management</h2>
+        <div style="display:flex;gap:8px;">
+          <label style="display:flex;align-items:center;gap:6px;font-size:.85rem;color:#64748b;">
+            <input type="checkbox" id="usr-show-inactive" onchange="SSIUsers.refresh()"/> Show inactive
+          </label>
+          <button class="btn btn-primary" onclick="SSIUsers.openForm()">+ Add User</button>
+        </div>
+      </div>
+
+      <div class="card" style="overflow-x:auto;">
+        <table style="width:100%;border-collapse:collapse;">
+          <thead>
+            <tr style="background:#f8fafc;text-align:left;">
+              <th style="padding:10px;">Name</th>
+              <th style="padding:10px;">Username</th>
+              <th style="padding:10px;">Role</th>
+              <th style="padding:10px;">Status</th>
+              <th style="padding:10px;">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="users-tbody">${renderRows()}</tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  function renderRows() {
+    const st = SSIApp.getState();
+    const showInactive = document.getElementById('usr-show-inactive')?.checked;
+    let users = st.users || [];
+    if (!showInactive) users = users.filter(u => u.active !== false);
+    if (!users.length) return `<tr><td colspan="5" style="text-align:center;padding:40px;color:#94a3b8;">No users found.</td></tr>`;
 
     const currentUser = SSIApp.state.currentUser;
 
-    return users.map((u, idx) => {
-      const isActive  = u.active !== false;
-      const isSelf    = currentUser && currentUser.username === u.username;
+    return users.map((u) => {
+      const isActive = u.active !== false;
+      const isSelf   = currentUser && currentUser.username === u.username;
       const statusBadge = isActive
-        ? `<span style="background:#dcfce7;color:#166534;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600;">✅ Active</span>`
-        : `<span style="background:#fee2e2;color:#991b1b;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600;">🔴 Inactive</span>`;
-
-      return `<tr style="border-bottom:1px solid #f1f5f9;${isSelf ? 'background:#fefce8;' : ''}">
-        <td style="padding:10px 14px;color:#94a3b8;font-size:12px;">${idx + 1}${isSelf ? ' <span title="You" style="color:#d97706;">★</span>' : ''}</td>
-        <td style="padding:10px 14px;font-weight:600;">${u.name}</td>
-        <td style="padding:10px 14px;"><code style="background:#f1f5f9;padding:2px 8px;border-radius:4px;font-size:12px;">${u.username}</code></td>
-        <td style="padding:10px 14px;">${roleBadge(u.role)}</td>
-        <td style="padding:10px 14px;">${statusBadge}</td>
-        <td style="padding:10px 14px;text-align:right;white-space:nowrap;">
-          <button class="btn btn-secondary btn-sm" onclick="SSIUsers.openForm('${u.id}')" title="Edit user">✏️ Edit</button>
-          <button class="btn btn-secondary btn-sm" onclick="SSIUsers.toggleActive('${u.id}')"
-            title="${isActive ? 'Disable user' : 'Enable user'}"
-            ${isSelf ? 'disabled title="Cannot disable your own account"' : ''}>
-            ${isActive ? '🔴 Disable' : '🟢 Enable'}
-          </button>
-          <button class="btn btn-danger btn-sm" onclick="SSIUsers.deleteUser('${u.id}')"
-            title="Delete user"
-            ${isSelf ? 'disabled title="Cannot delete your own account"' : ''}>
-            🗑️
-          </button>
-        </td>
-      </tr>`;
+        ? `<span style="background:#d1fae5;color:#065f46;padding:2px 10px;border-radius:999px;font-size:.7rem;font-weight:700;">Active</span>`
+        : `<span style="background:#fee2e2;color:#991b1b;padding:2px 10px;border-radius:999px;font-size:.7rem;font-weight:700;">Inactive</span>`;
+      return `
+        <tr style="border-bottom:1px solid #e2e8f0;">
+          <td style="padding:10px;">${u.name||''}</td>
+          <td style="padding:10px;color:#64748b;">${u.username||''}</td>
+          <td style="padding:10px;">${roleBadge(u.role)}</td>
+          <td style="padding:10px;">${statusBadge}</td>
+          <td style="padding:10px;">
+            <button class="btn btn-sm" onclick="SSIUsers.openForm('${u.id}')">✏️ Edit</button>
+            <button class="btn btn-sm" onclick="SSIUsers.toggleActive('${u.id}')">${isActive?'🚫 Disable':'🟢 Enable'}</button>
+            ${isSelf ? '' : `<button class="btn btn-sm btn-danger" onclick="SSIUsers.softDelete('${u.id}')">🗑️ Delete</button>`}
+          </td>
+        </tr>`;
     }).join('');
   }
 
-  function refresh() {
-    const tbody = document.getElementById('users-tbody');
-    if (tbody) tbody.innerHTML = buildRows();
-  }
-
-  /* ── Add / Edit form modal ────────────────────────────── */
+  /* ── Form (add / edit) ────────────────────────────────── */
   function openForm(userId) {
-    const st   = SSIApp.getState();
+    const st = SSIApp.getState();
     const user = userId ? (st.users || []).find(u => u.id === userId) : null;
     const isEdit = !!user;
 
-    const overlay = document.createElement('div');
-    overlay.id    = 'user-modal-overlay';
-    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:1000;display:flex;align-items:center;justify-content:center;padding:1rem;';
-
-    overlay.innerHTML = `
-      <div style="background:#fff;border-radius:1rem;padding:1.75rem;width:100%;max-width:440px;box-shadow:0 20px 60px rgba(0,0,0,.2);">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1.25rem;">
-          <h3 style="font-size:1.1rem;font-weight:700;margin:0;">${isEdit ? '✏️ Edit' : '➕ Add'} User</h3>
-          <button onclick="document.getElementById('user-modal-overlay').remove()"
-            style="background:none;border:none;font-size:1.25rem;cursor:pointer;color:#64748b;line-height:1;">✕</button>
-        </div>
-
-        <div style="display:flex;flex-direction:column;gap:.9rem;">
-          <div>
-            <label style="display:block;font-size:.82rem;font-weight:600;color:#374151;margin-bottom:.3rem;">Full Name *</label>
-            <input id="usr-name" class="form-input" type="text" value="${user?.name || ''}" placeholder="e.g. Rahul Sharma" />
-          </div>
-          <div>
-            <label style="display:block;font-size:.82rem;font-weight:600;color:#374151;margin-bottom:.3rem;">Username *</label>
-            <input id="usr-username" class="form-input" type="text" value="${user?.username || ''}" placeholder="e.g. rahul" autocomplete="off" />
-          </div>
-          <div>
-            <label style="display:block;font-size:.82rem;font-weight:600;color:#374151;margin-bottom:.3rem;">${isEdit ? 'New Password <span style="color:#94a3b8;font-weight:400;">(leave blank to keep current)</span>' : 'Password *'}</label>
-            <input id="usr-password" class="form-input" type="password" value="" placeholder="${isEdit ? 'Leave blank to keep current' : 'Enter password'}" autocomplete="new-password" />
-          </div>
-          <div>
-            <label style="display:block;font-size:.82rem;font-weight:600;color:#374151;margin-bottom:.3rem;">Role *</label>
-            <select id="usr-role" class="form-input">
-              ${ROLES.map(r => {
-                const labels = {
-                  ADMIN:'ADMIN – Full Access',
-                  STOCK:'STOCK – Inventory only',
-                  DISPATCH:'DISPATCH – Dispatch only',
-                  SALES:'SALES – Orders & Clients',
-                  ACCOUNTANT:'ACCOUNTANT – HR (Employees, Attendance, Payroll)',
-                  ACCOUNTS:'ACCOUNTS – Payroll (Workers only, no other data)'
-                };
-                return `<option value="${r}" ${(user?.role || 'SALES') === r ? 'selected' : ''}>${labels[r]||r}</option>`;
-              }).join('')}
-            </select>
-          </div>
-          <div style="display:flex;align-items:center;gap:.5rem;">
-            <input type="checkbox" id="usr-active" ${(user?.active !== false) ? 'checked' : ''} style="width:auto;cursor:pointer;" />
-            <label for="usr-active" style="font-size:.85rem;font-weight:500;cursor:pointer;">Account Active</label>
-          </div>
-        </div>
-
-        <div id="usr-err" style="display:none;margin-top:.75rem;padding:.5rem .75rem;background:#fee2e2;color:#991b1b;border-radius:.5rem;font-size:.82rem;"></div>
-
-        <div style="display:flex;gap:.75rem;justify-content:flex-end;margin-top:1.5rem;">
-          <button class="btn btn-secondary" onclick="document.getElementById('user-modal-overlay').remove()">Cancel</button>
-          <button class="btn btn-primary" onclick="SSIUsers.saveUser('${userId || ''}')">💾 Save User</button>
+    const modal = document.createElement('div');
+    modal.id = 'user-modal-overlay';
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:9999;';
+    modal.innerHTML = `
+      <div class="card" style="width:420px;max-width:95%;background:#fff;padding:20px;border-radius:8px;">
+        <h3 style="margin:0 0 16px;">${isEdit?'Edit User':'Add User'}</h3>
+        <div id="usr-err" style="display:none;background:#fee2e2;color:#991b1b;padding:8px;border-radius:6px;margin-bottom:12px;font-size:.85rem;"></div>
+        <label style="display:block;margin-bottom:12px;">Full Name<br>
+          <input id="usr-name" type="text" value="${user?.name||''}" style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:6px;"></label>
+        <label style="display:block;margin-bottom:12px;">Username<br>
+          <input id="usr-username" type="text" value="${user?.username||''}" style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:6px;" ${isEdit?'readonly':''}></label>
+        <label style="display:block;margin-bottom:12px;">Password ${isEdit?'(leave blank to keep)':''}<br>
+          <input id="usr-password" type="text" value="" style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:6px;"></label>
+        <label style="display:block;margin-bottom:12px;">Role<br>
+          <select id="usr-role" style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:6px;">
+            ${ROLES.map(r => `<option value="${r}" ${(user?.role || 'SALES') === r ? 'selected' : ''}>${r}</option>`).join('')}
+          </select></label>
+        <label style="display:flex;align-items:center;gap:6px;margin-bottom:16px;">
+          <input id="usr-active" type="checkbox" ${user?.active !== false ? 'checked' : ''}/> Active
+        </label>
+        <div style="display:flex;justify-content:flex-end;gap:8px;">
+          <button class="btn" onclick="document.getElementById('user-modal-overlay').remove()">Cancel</button>
+          <button class="btn btn-primary" onclick="SSIUsers.saveUser('${userId||''}')">💾 Save User</button>
         </div>
       </div>`;
-
-    document.body.appendChild(overlay);
-    document.getElementById('usr-name').focus();
+    document.body.appendChild(modal);
   }
 
   /* ── Save user (create or update) ────────────────────── */
   async function saveUser(userId) {
-    // Prevent double-click / double-submit
     const saveBtn = document.querySelector('#user-modal-overlay .btn-primary');
     if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = '⏳ Saving…'; }
 
@@ -184,52 +145,38 @@ const SSIUsers = (() => {
 
     function showErr(msg) {
       if (errEl) { errEl.textContent = msg; errEl.style.display = 'block'; }
-      // Re-enable save button so user can correct and retry
       const btn = document.querySelector('#user-modal-overlay .btn-primary');
       if (btn) { btn.disabled = false; btn.textContent = '💾 Save User'; }
     }
 
-    if (!name)     { showErr('Full Name is required.'); return; }
-    if (!username) { showErr('Username is required.'); return; }
-    if (!/^[a-z0-9_.@-]+$/.test(username)) { showErr('Username may only contain letters, numbers, underscore, hyphen, dot or @.'); return; }
+    if (!name)     return showErr('Full Name is required.');
+    if (!username) return showErr('Username is required.');
+    if (!/^[a-z0-9_.@-]+$/.test(username)) return showErr('Username may only contain letters, numbers, underscore, hyphen, dot or @.');
 
-    const st    = SSIApp.getState();
+    const st = SSIApp.getState();
     const users = st.users || [];
     const isEdit = !!userId;
 
-    // Check duplicate username
     const dup = users.find(u => u.username === username && u.id !== userId);
-    if (dup) { showErr(`Username "${username}" is already taken.`); return; }
+    if (dup) return showErr(`Username "${username}" is already taken.`);
 
-    if (!isEdit && !password) { showErr('Password is required for new users.'); return; }
+    if (!isEdit && !password) return showErr('Password is required for new users.');
 
     if (isEdit) {
       const user = users.find(u => u.id === userId);
-      if (!user) { showErr('User not found.'); return; }
+      if (!user) return showErr('User not found.');
       user.name     = name;
-      user.username = username;
       user.role     = role;
       user.active   = active;
-      if (password) user.password = password;   // Only update if new password provided
+      if (password) user.password = password;
       await SSIApp.saveState(st);
       SSIApp.toast('✅ User updated', 'success');
       SSIApp.audit('USER_EDIT', `Updated user: ${username} (${role})`);
     } else {
-      // New user
-      const newUser = {
-        id:       SSIApp.uid(),
-        name,
-        username,
-        password,
-        role,
-        active,
-      };
-      // Safety dedup: never add if same id already present
-      if (!st.users.find(x => x.id === newUser.id)) {
-        st.users = [...users, newUser];
-      }
+      const newUser = { id: SSIApp.uid(), name, username, password, role, active };
+      st.users = [...users, newUser];
       await SSIApp.saveState(st);
-      SSIApp.toast('✅ User "' + name + '" created', 'success');
+      SSIApp.toast(`✅ User "${name}" created`, 'success');
       SSIApp.audit('USER_CREATE', `Created user: ${username} (${role})`);
     }
 
@@ -240,56 +187,66 @@ const SSIUsers = (() => {
   /* ── Toggle active/inactive ───────────────────────────── */
   async function toggleActive(userId) {
     const currentUser = SSIApp.state.currentUser;
-    const st    = SSIApp.getState();
-    const user  = (st.users || []).find(u => u.id === userId);
+    const st = SSIApp.getState();
+    const user = (st.users || []).find(u => u.id === userId);
     if (!user) return;
 
-    // Cannot disable self
     if (currentUser && currentUser.username === user.username) {
       SSIApp.toast('⚠️ You cannot disable your own account', 'warning');
       return;
     }
 
-    user.active = !user.active;
+    if (user.active !== false && user.role === 'ADMIN') {
+      const adminCount = (st.users || []).filter(u => u.role === 'ADMIN' && u.active !== false).length;
+      if (adminCount <= 1) {
+        SSIApp.toast('⚠️ Cannot disable the only active Admin account', 'warning');
+        return;
+      }
+    }
+
+    user.active = user.active === false ? true : false;
     await SSIApp.saveState(st);
-    const action = user.active ? '🟢 Enabled' : '🔴 Disabled';
+    const action = user.active ? '🟢 Enabled' : '🚫 Disabled';
     SSIApp.toast(`${action}: ${user.name}`);
     SSIApp.audit('USER_TOGGLE', `${action} user: ${user.username}`);
     refresh();
   }
 
-  /* ── Delete user ─────────────────────────────────────── */
-  async function deleteUser(userId) {
+  /* ── Soft delete user ────────────────────────────────── */
+  async function softDelete(userId) {
     const currentUser = SSIApp.state.currentUser;
-    const st   = SSIApp.getState();
+    const st = SSIApp.getState();
     const user = (st.users || []).find(u => u.id === userId);
     if (!user) return;
 
-    // Cannot delete self
     if (currentUser && currentUser.username === user.username) {
       SSIApp.toast('⚠️ You cannot delete your own account', 'warning');
       return;
     }
 
-    // Prevent deleting the only ADMIN
-    const adminCount = (st.users || []).filter(u => u.role === 'ADMIN' && u.active !== false).length;
-    if (user.role === 'ADMIN' && adminCount <= 1) {
-      SSIApp.toast('⚠️ Cannot delete the only active Admin account', 'warning');
-      return;
+    if (user.role === 'ADMIN') {
+      const adminCount = (st.users || []).filter(u => u.role === 'ADMIN' && u.active !== false).length;
+      if (adminCount <= 1) {
+        SSIApp.toast('⚠️ Cannot delete the only active Admin account', 'warning');
+        return;
+      }
     }
 
     const ok = await SSIApp.confirm(
-      `Permanently delete user "${user.name}" (${user.username})?\n\nRole: ${user.role}\n\nThis cannot be undone.`
+      `⚠️ Confirm Delete\n\nUser: "${user.name}" (${user.username})\nRole: ${user.role}\n\nThe user will be marked INACTIVE and hidden from the active list.\n` +
+      `Their history will be preserved.\n\nProceed?`
     );
     if (!ok) return;
 
-    st.users = (st.users || []).filter(u => u.id !== userId);
+    user.active = false;
+    user.deleted_at = new Date().toISOString();
+    user.deleted_by = currentUser?.username || 'unknown';
     await SSIApp.saveState(st);
-    SSIApp.toast('🗑️ User deleted');
-    SSIApp.audit('USER_DELETE', `Deleted user: ${user.username} (${user.role})`);
+    SSIApp.toast('🗑️ User marked inactive');
+    SSIApp.audit('USER_SOFT_DELETE', `Soft-deleted user: ${user.username} (${user.role})`);
     refresh();
   }
 
-  return { render, refresh, openForm, saveUser, toggleActive, deleteUser };
+  return { render, refresh, openForm, saveUser, toggleActive, softDelete };
 
 })();
