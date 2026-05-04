@@ -1,6 +1,7 @@
 /* ============================================================
-   SSI Inventory Module (v2 SAFE) — Smart Entry
+   SSI Inventory Module (v2.1 SAFE) — Smart Entry
    Stage 1 Batch 2: confirmation popups + soft delete + restore + type-to-confirm Reset
+   v2.1 fixes: persistent "Show deleted" toggle + safe confirm + reliable import prompt
    ============================================================ */
 const SSIInventory = (() => {
   const ENTRY_TYPES = [
@@ -20,6 +21,17 @@ const SSIInventory = (() => {
     { value:'DIRECT_KG',   label:'⚖️ Direct KG Entry' },
     { value:'NOS',         label:'🔢 Units / NOS' },
   ];
+
+  // Persistent UI flag — survives refresh()
+  let _showDeleted = false;
+
+  // Safe confirm helper — uses SSIApp.confirm if available, else native confirm
+  async function _safeConfirm(msg) {
+    if (window.SSIApp && typeof SSIApp.confirm === 'function') {
+      try { return await SSIApp.confirm(msg); } catch(e) { /* fall through */ }
+    }
+    return window.confirm(msg);
+  }
 
   /* ── Helper: append a history entry to an inventory record ───── */
   function _addHistory(entry, action, detail) {
@@ -42,9 +54,10 @@ const SSIInventory = (() => {
   }
 
   function refresh(area) {
+    if (!area) area = document.getElementById('app-area') || document.getElementById('page-area');
+    if (!area) return;
     const st = SSIApp.getState();
 
-    // Active (non-deleted) ledger for balance & default display
     const allLedger    = st.inventory || [];
     const activeLedger = allLedger.filter(t => t.active !== false);
 
@@ -63,8 +76,7 @@ const SSIInventory = (() => {
     });
 
     // Display set: active by default, with optional inactive view
-    const showInactiveCb = document.getElementById('inv-show-inactive');
-    const showInactive   = !!(showInactiveCb && showInactiveCb.checked);
+    const showInactive = _showDeleted;
     const displaySet = showInactive
       ? [...allLedger].sort((a,b) => new Date(b.date) - new Date(a.date))
       : [...activeLedger].reverse();
@@ -75,7 +87,7 @@ const SSIInventory = (() => {
         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
           ${SSIApp.hasRole('ADMIN') ? `
             <label style="display:flex;align-items:center;gap:6px;font-size:.85rem;color:#64748b;">
-              <input type="checkbox" id="inv-show-inactive" ${showInactive?'checked':''} onchange="SSIInventory.refresh()"/> Show deleted
+              <input type="checkbox" id="inv-show-inactive" ${showInactive?'checked':''} onchange="SSIInventory.toggleShowDeleted(this.checked)"/> Show deleted
             </label>` : ''}
           <button class="btn btn-secondary btn-sm" onclick="SSIInventory.downloadTemplate()">⬇️ Template</button>
           <label class="btn btn-secondary btn-sm" style="cursor:pointer;">
@@ -137,7 +149,7 @@ const SSIInventory = (() => {
             </tbody>
           </table>
         </div>
-        <div id="inv-count-total" style="margin-top:12px;font-size:13px;color:#94a3b8;">Total: ${displaySet.length} entries</div>
+        <div id="inv-count-total" style="margin-top:12px;font-size:13px;color:#94a3b8;">Total: ${displaySet.length} entries${showInactive ? ' (including deleted)' : ''}</div>
       </div>`;
   }
 
@@ -159,24 +171,25 @@ const SSIInventory = (() => {
       const balClr = balNeg ? '#dc2626' : (bal === 0 ? '#94a3b8' : '#15803d');
       const balIcon= balNeg ? '⚠️ ' : '';
       const isInactive = t.active === false;
-      const rowStyle = isInactive ? 'background:#fafafa;opacity:.65;text-decoration:line-through;' : '';
+      const rowStyle = isInactive ? 'background:#fafafa;opacity:.65;' : '';
+      const strike   = isInactive ? 'text-decoration:line-through;' : '';
       return `<tr data-unit="${t.unit_id}" data-product="${t.product_id}" data-type="${t.type}" data-date="${t.date}" style="${rowStyle}">
-        <td style="white-space:nowrap;">${SSIApp.dateFmt(t.date)}</td>
+        <td style="white-space:nowrap;${strike}">${SSIApp.dateFmt(t.date)}</td>
         <td>
           <span style="background:${bg};color:${tc};padding:3px 8px;border-radius:6px;font-size:12px;font-weight:600;">${t.type}</span>
           ${isInactive ? '<br><span style="background:#fee2e2;color:#991b1b;font-size:10px;padding:1px 5px;border-radius:3px;">DELETED</span>' : ''}
         </td>
-        <td style="font-size:13px;">${unit?.name||'—'}</td>
-        <td><strong>${prod?.name||'—'}</strong><br><span style="font-size:11px;color:#94a3b8;">${prod?.sku||''}</span></td>
-        <td style="font-size:12px;color:#64748b;">${t.pack_desc||'—'}</td>
-        <td style="text-align:right;font-weight:700;color:${isOut?'#dc2626':'#16a34a'};">${isOut?'-':'+'} ${SSIApp.qtyFmt(t.qty)} ${prod?.uom||'KG'}</td>
+        <td style="font-size:13px;${strike}">${unit?.name||'—'}</td>
+        <td style="${strike}"><strong>${prod?.name||'—'}</strong><br><span style="font-size:11px;color:#94a3b8;">${prod?.sku||''}</span></td>
+        <td style="font-size:12px;color:#64748b;${strike}">${t.pack_desc||'—'}</td>
+        <td style="text-align:right;font-weight:700;color:${isOut?'#dc2626':'#16a34a'};${strike}">${isOut?'-':'+'} ${SSIApp.qtyFmt(t.qty)} ${prod?.uom||'KG'}</td>
         <td style="text-align:right;">
           ${isInactive ? '<span style="color:#94a3b8;font-size:12px;">—</span>' : `
             <span style="display:inline-block;background:${balBg};color:${balClr};padding:3px 10px;border-radius:8px;font-size:13px;font-weight:700;white-space:nowrap;">
               ${balIcon}${SSIApp.qtyFmt(Math.abs(bal))} ${prod?.uom||'KG'}
             </span>`}
         </td>
-        <td style="font-size:12px;color:#64748b;max-width:180px;">
+        <td style="font-size:12px;color:#64748b;max-width:180px;${strike}">
           ${t.type==='ISSUE' && t.issued_to
             ? `<div style="font-weight:600;color:#6d28d9;">${t.issued_to}</div>
                <div style="color:#7c3aed;font-size:11px;">${t.purpose||'—'}</div>
@@ -213,7 +226,12 @@ const SSIInventory = (() => {
       if (show) visible++;
     });
     const cnt = document.getElementById('inv-count-total');
-    if (cnt) cnt.textContent = `Showing: ${visible} entries`;
+    if (cnt) cnt.textContent = `Showing: ${visible} entries${_showDeleted ? ' (including deleted)' : ''}`;
+  }
+
+  function toggleShowDeleted(checked) {
+    _showDeleted = !!checked;
+    refresh(document.getElementById('app-area') || document.getElementById('page-area'));
   }
 
   function _onTypeChange(type) {
@@ -631,7 +649,7 @@ const SSIInventory = (() => {
     SSIApp.toast(`✅ Entry saved: ${SSIApp.qtyFmt(qty)} ${prod?.uom||'KG'} added`);
     SSIApp.audit('INV_ENTRY', `${type} ${qty} ${prod?.name}`);
     SSIApp.closeModal();
-    refresh(document.getElementById('page-area'));
+    refresh(document.getElementById('app-area') || document.getElementById('page-area'));
   }
 
   /* ── Soft delete inventory entry (Admin only) ────────────── */
@@ -643,7 +661,7 @@ const SSIInventory = (() => {
     const prod = (st.products||[]).find(p => p.id === t.product_id);
     const unit = (st.units||[]).find(u => u.id === t.unit_id);
 
-    const ok = await SSIApp.confirm(
+    const ok = await _safeConfirm(
       `⚠️ Delete Inventory Entry?\n\n` +
       `Date: ${SSIApp.dateFmt(t.date)}\n` +
       `Type: ${t.type}\n` +
@@ -663,7 +681,7 @@ const SSIInventory = (() => {
     await SSIApp.saveState(st);
     SSIApp.toast('🗑️ Inventory entry marked deleted');
     SSIApp.audit('INV_SOFT_DELETE', `${t.type} ${t.qty} ${prod?.name||''} (${t.id})`);
-    refresh(document.getElementById('page-area'));
+    refresh(document.getElementById('app-area') || document.getElementById('page-area'));
   }
 
   /* ── Restore a soft-deleted entry ────────────────────────── */
@@ -681,7 +699,7 @@ const SSIInventory = (() => {
     await SSIApp.saveState(st);
     SSIApp.toast('♻️ Entry restored');
     SSIApp.audit('INV_RESTORE', `${t.type} ${t.qty} (${t.id})`);
-    refresh(document.getElementById('page-area'));
+    refresh(document.getElementById('app-area') || document.getElementById('page-area'));
   }
 
   /* ── View history of an entry ────────────────────────────── */
@@ -775,7 +793,7 @@ const SSIInventory = (() => {
       const user = SSIApp.currentUser();
 
       // Confirm before importing — these can be many rows
-      const ok = await SSIApp.confirm(
+      const ok = await _safeConfirm(
         `📥 Import ${rows.length} inventory rows from this file?\n\nThis will ADD entries to the ledger (existing entries are NOT replaced).\n\nProceed?`
       );
       if (!ok) { input.value=''; return; }
@@ -837,7 +855,7 @@ const SSIInventory = (() => {
       SSIApp.toast(msg, errors.length ? 'warning' : 'success');
       if (errors.length) console.warn('Import errors:', errors);
       SSIApp.audit('INV_IMPORT', `${added} entries`);
-      refresh(document.getElementById('page-area'));
+      refresh(document.getElementById('app-area') || document.getElementById('page-area'));
     } catch (e) {
       SSIApp.toast('Import failed: ' + e.message, 'error');
     }
@@ -852,7 +870,7 @@ const SSIInventory = (() => {
     const activeCount = all.filter(t => t.active !== false).length;
     if (activeCount === 0) { SSIApp.toast('Inventory is already empty.'); return; }
 
-    const ok1 = await SSIApp.confirm(
+    const ok1 = await _safeConfirm(
       `⚠️ RESET INVENTORY TO ZERO?\n\nThis will mark ALL ${activeCount} active inventory entries as DELETED.\n\nThey will be excluded from stock balance but kept in history (visible via "Show deleted").\nYou can restore individual entries later.\n\nClick OK to proceed to final confirmation.`
     );
     if (!ok1) return;
@@ -878,11 +896,13 @@ const SSIInventory = (() => {
 
     SSIApp.audit('INVENTORY_RESET_SOFT', `Marked ${count} inventory entries deleted (kept in history)`);
 
-    // Persist via the safe SSIApp.saveState path (uses Stage 1 stale-write guard)
     await SSIApp.saveState(st);
 
-    SSIApp.toast(`✅ Inventory reset — ${count} entries marked deleted (recoverable)`);
-    refresh(document.getElementById('page-area'));
+    // Auto-show deleted so user can see what happened
+    _showDeleted = true;
+
+    SSIApp.toast(`✅ Inventory reset — ${count} entries marked deleted (recoverable). "Show deleted" turned on.`);
+    refresh(document.getElementById('app-area') || document.getElementById('page-area'));
   }
 
   function _confirmTyped(message, expectedText) {
@@ -914,6 +934,7 @@ const SSIInventory = (() => {
     render, refresh, applyFilter, _onTypeChange,
     openEntryModal, onProductUnitChange, onPackModeChange, calcTotal,
     saveEntry, deleteEntry, restoreEntry, viewHistory, clearInventory,
-    exportExcel, downloadTemplate, importExcel
+    exportExcel, downloadTemplate, importExcel,
+    toggleShowDeleted, _safeConfirm
   };
 })();
