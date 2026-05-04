@@ -1,4 +1,7 @@
-/* SSI Inventory Module - Smart Entry */
+/* ============================================================
+   SSI Inventory Module (v2 SAFE) — Smart Entry
+   Stage 1 Batch 2: confirmation popups + soft delete + restore + type-to-confirm Reset
+   ============================================================ */
 const SSIInventory = (() => {
   const ENTRY_TYPES = [
     { value:'OPENING',     label:'📂 Opening Stock' },
@@ -18,6 +21,18 @@ const SSIInventory = (() => {
     { value:'NOS',         label:'🔢 Units / NOS' },
   ];
 
+  /* ── Helper: append a history entry to an inventory record ───── */
+  function _addHistory(entry, action, detail) {
+    if (!entry.history) entry.history = [];
+    entry.history.push({
+      action,
+      detail: detail || '',
+      ts: new Date().toISOString(),
+      user: SSIApp.state.currentUser?.username || 'unknown',
+      user_name: SSIApp.state.currentUser?.name || ''
+    });
+  }
+
   function render(area) {
     if (!SSIApp.hasRole('ADMIN','STOCK','ACCOUNTS')) {
       area.innerHTML = '<div class="empty-state"><div class="icon">🔒</div><p>Access Denied</p></div>';
@@ -28,26 +43,40 @@ const SSIInventory = (() => {
 
   function refresh(area) {
     const st = SSIApp.getState();
-    // Sort ascending for running balance calculation, then reverse for display (newest first)
-    const ledgerAsc = [...st.inventory].sort((a,b) => {
+
+    // Active (non-deleted) ledger for balance & default display
+    const allLedger    = st.inventory || [];
+    const activeLedger = allLedger.filter(t => t.active !== false);
+
+    // Sort ascending for running balance, then reverse for display (newest first)
+    const ledgerAsc = [...activeLedger].sort((a,b) => {
       const d = new Date(a.date) - new Date(b.date);
       return d !== 0 ? d : (a.created_at||'').localeCompare(b.created_at||'');
     });
-    // Pre-compute running balance per (unit_id, product_id) pair — chronological order
-    const balanceMap = {};  // key: `${unit_id}|${product_id}` → running total after each entry (by entry id)
+    const balanceMap = {};
     ledgerAsc.forEach(t => {
       const key = `${t.unit_id}|${t.product_id}`;
       if (!balanceMap[key]) balanceMap[key] = 0;
       const isOut = ['OUT','TRANSFER_OUT','ISSUE'].includes(t.type);
       balanceMap[key] += isOut ? -(t.qty||0) : (t.qty||0);
-      t._runningBal = balanceMap[key];  // attach to entry object (temp)
+      t._runningBal = balanceMap[key];
     });
-    const ledger = [...ledgerAsc].reverse();  // newest first for display
+
+    // Display set: active by default, with optional inactive view
+    const showInactiveCb = document.getElementById('inv-show-inactive');
+    const showInactive   = !!(showInactiveCb && showInactiveCb.checked);
+    const displaySet = showInactive
+      ? [...allLedger].sort((a,b) => new Date(b.date) - new Date(a.date))
+      : [...activeLedger].reverse();
 
     area.innerHTML = `
       <div class="page-header">
         <h2 class="page-title">🏭 Inventory Ledger</h2>
-        <div style="display:flex;gap:10px;flex-wrap:wrap;">
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+          ${SSIApp.hasRole('ADMIN') ? `
+            <label style="display:flex;align-items:center;gap:6px;font-size:.85rem;color:#64748b;">
+              <input type="checkbox" id="inv-show-inactive" ${showInactive?'checked':''} onchange="SSIInventory.refresh()"/> Show deleted
+            </label>` : ''}
           <button class="btn btn-secondary btn-sm" onclick="SSIInventory.downloadTemplate()">⬇️ Template</button>
           <label class="btn btn-secondary btn-sm" style="cursor:pointer;">
             📥 Import Excel <input type="file" accept=".xlsx,.xls" style="display:none;" onchange="SSIInventory.importExcel(this)">
@@ -101,19 +130,20 @@ const SSIInventory = (() => {
               <th>Pack Mode</th><th style="text-align:right;">Qty (KG/NOS)</th>
               <th style="text-align:right;">Closing Balance</th>
               <th>Bill / Note</th><th>By</th>
-              
+              ${SSIApp.hasRole('ADMIN') ? '<th>Actions</th>' : ''}
             </tr></thead>
             <tbody id="inv-tbody">
-              ${renderRows(ledger, st)}
+              ${renderRows(displaySet, st)}
             </tbody>
           </table>
         </div>
-        <div id="inv-count-total" style="margin-top:12px;font-size:13px;color:#94a3b8;">Total: ${ledger.length} entries</div>
+        <div id="inv-count-total" style="margin-top:12px;font-size:13px;color:#94a3b8;">Total: ${displaySet.length} entries</div>
       </div>`;
   }
 
   function renderRows(ledger, st) {
-    if (!ledger.length) return `<tr><td colspan="9" style="text-align:center;padding:40px;color:#94a3b8;">No inventory entries yet. Add your first entry!</td></tr>`;
+    const isAdmin = SSIApp.hasRole('ADMIN');
+    if (!ledger.length) return `<tr><td colspan="${isAdmin?10:9}" style="text-align:center;padding:40px;color:#94a3b8;">No inventory entries yet. Add your first entry!</td></tr>`;
     const typeColors     = {IN:'#dcfce7',OUT:'#fee2e2',OPENING:'#FDECEA',ADJUST:'#fef3c7',TRANSFER_OUT:'#fce7f3',TRANSFER_IN:'#ede9fe',ISSUE:'#ede9fe'};
     const typeTextColors = {IN:'#166534',OUT:'#991b1b',OPENING:'#D35400',ADJUST:'#92400e',TRANSFER_OUT:'#9d174d',TRANSFER_IN:'#5b21b6',ISSUE:'#6d28d9'};
     return ledger.map(t => {
@@ -125,21 +155,26 @@ const SSIInventory = (() => {
       const isOut  = ['OUT','TRANSFER_OUT','ISSUE'].includes(t.type);
       const bal    = t._runningBal ?? 0;
       const balNeg = bal < 0;
-      // Closing balance cell styling
       const balBg  = balNeg ? '#fee2e2' : (bal === 0 ? '#f1f5f9' : '#f0fdf4');
       const balClr = balNeg ? '#dc2626' : (bal === 0 ? '#94a3b8' : '#15803d');
       const balIcon= balNeg ? '⚠️ ' : '';
-      return `<tr data-unit="${t.unit_id}" data-product="${t.product_id}" data-type="${t.type}" data-date="${t.date}">
+      const isInactive = t.active === false;
+      const rowStyle = isInactive ? 'background:#fafafa;opacity:.65;text-decoration:line-through;' : '';
+      return `<tr data-unit="${t.unit_id}" data-product="${t.product_id}" data-type="${t.type}" data-date="${t.date}" style="${rowStyle}">
         <td style="white-space:nowrap;">${SSIApp.dateFmt(t.date)}</td>
-        <td><span style="background:${bg};color:${tc};padding:3px 8px;border-radius:6px;font-size:12px;font-weight:600;">${t.type}</span></td>
+        <td>
+          <span style="background:${bg};color:${tc};padding:3px 8px;border-radius:6px;font-size:12px;font-weight:600;">${t.type}</span>
+          ${isInactive ? '<br><span style="background:#fee2e2;color:#991b1b;font-size:10px;padding:1px 5px;border-radius:3px;">DELETED</span>' : ''}
+        </td>
         <td style="font-size:13px;">${unit?.name||'—'}</td>
         <td><strong>${prod?.name||'—'}</strong><br><span style="font-size:11px;color:#94a3b8;">${prod?.sku||''}</span></td>
         <td style="font-size:12px;color:#64748b;">${t.pack_desc||'—'}</td>
         <td style="text-align:right;font-weight:700;color:${isOut?'#dc2626':'#16a34a'};">${isOut?'-':'+'} ${SSIApp.qtyFmt(t.qty)} ${prod?.uom||'KG'}</td>
         <td style="text-align:right;">
-          <span style="display:inline-block;background:${balBg};color:${balClr};padding:3px 10px;border-radius:8px;font-size:13px;font-weight:700;white-space:nowrap;">
-            ${balIcon}${SSIApp.qtyFmt(Math.abs(bal))} ${prod?.uom||'KG'}
-          </span>
+          ${isInactive ? '<span style="color:#94a3b8;font-size:12px;">—</span>' : `
+            <span style="display:inline-block;background:${balBg};color:${balClr};padding:3px 10px;border-radius:8px;font-size:13px;font-weight:700;white-space:nowrap;">
+              ${balIcon}${SSIApp.qtyFmt(Math.abs(bal))} ${prod?.uom||'KG'}
+            </span>`}
         </td>
         <td style="font-size:12px;color:#64748b;max-width:180px;">
           ${t.type==='ISSUE' && t.issued_to
@@ -149,7 +184,13 @@ const SSIInventory = (() => {
             : (t.note||'—')}
         </td>
         <td style="font-size:12px;color:#94a3b8;">${user?.name||t.user_name||'—'}</td>
-        
+        ${isAdmin ? `
+          <td style="white-space:nowrap;">
+            ${t.history && t.history.length ? `<button class="btn btn-secondary btn-sm" onclick="SSIInventory.viewHistory('${t.id}')" title="View history">🕒</button>` : ''}
+            ${isInactive
+              ? `<button class="btn btn-secondary btn-sm" onclick="SSIInventory.restoreEntry('${t.id}')" title="Restore">♻️</button>`
+              : `<button class="btn btn-danger btn-sm" onclick="SSIInventory.deleteEntry('${t.id}')" title="Delete (soft)">🗑️</button>`}
+          </td>` : ''}
       </tr>`;
     }).join('');
   }
@@ -217,7 +258,6 @@ const SSIInventory = (() => {
           </div>
         </div>
 
-        <!-- Product Info Card -->
         <div id="inv-info-card" style="display:none;" class="info-card">
           <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center;">
             <div><span style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">UoM</span><br><strong id="inv-uom-badge">KG</strong></div>
@@ -227,7 +267,6 @@ const SSIInventory = (() => {
           </div>
         </div>
 
-        <!-- Pack Mode -->
         <div id="inv-pack-section" style="display:none;">
           <div style="margin-bottom:16px;">
             <label>Pack Type</label>
@@ -236,9 +275,7 @@ const SSIInventory = (() => {
             </select>
           </div>
 
-          <div id="inv-pack-fields" class="form-grid form-grid-3">
-            <!-- dynamically filled -->
-          </div>
+          <div id="inv-pack-fields" class="form-grid form-grid-3"></div>
 
           <div id="inv-total-display" style="display:none;background:#f0fdf4;border:2px solid #16a34a;border-radius:10px;padding:14px 20px;margin-top:16px;text-align:center;">
             <span style="font-size:13px;color:#16a34a;font-weight:600;">Total Quantity</span><br>
@@ -247,7 +284,6 @@ const SSIInventory = (() => {
           </div>
         </div>
 
-        <!-- ISSUE-specific fields (shown only when type = ISSUE) -->
         <div id="inv-issue-fields" style="display:none;margin-top:16px;padding:16px;background:#f5f3ff;border:1.5px solid #c4b5fd;border-radius:10px;">
           <div style="font-weight:700;font-size:13px;color:#6d28d9;margin-bottom:12px;">🔧 Internal Issue Details</div>
           <div class="form-grid form-grid-2">
@@ -274,7 +310,6 @@ const SSIInventory = (() => {
           </div>
         </div>
 
-        <!-- Note -->
         <div style="margin-top:16px;">
           <label>Bill No. / Note</label>
           <input id="inv-note" placeholder="e.g. Bill No. 1234 / Truck No. UP15AB1234">
@@ -321,7 +356,6 @@ const SSIInventory = (() => {
     onPackModeChange();
   }
 
-  // ─── Build the pack-fields HTML and wire up events ─────────
   function onPackModeChange() {
     const mode      = document.getElementById('inv-pack-mode')?.value;
     const fieldsDiv = document.getElementById('inv-pack-fields');
@@ -333,7 +367,6 @@ const SSIInventory = (() => {
     const prod = productId ? st.products.find(p=>p.id===productId) : null;
     const packOpts = (prod?.pack_sizes||[]).map(s=>`<option value="${s}">${s}</option>`).join('');
 
-    // Build HTML (NO inline onchange/oninput — we wire events below)
     let html = '';
 
     if (mode === 'BAG') {
@@ -392,18 +425,16 @@ const SSIInventory = (() => {
     fieldsDiv.innerHTML = html;
     if (totalDiv) totalDiv.style.display = 'block';
 
-    // ─── Wire up ALL events with addEventListener (reliable) ──
     _wireEvents(mode);
-    calcTotal();  // Show 0 initially until user fills fields
+    calcTotal();
   }
 
-  // Wire all input events after DOM insertion
   function _wireEvents(mode) {
     if (mode === 'BAG') {
-      const bagSizeEl = document.getElementById('inv-bag-size');
+      const bagSizeEl  = document.getElementById('inv-bag-size');
       const customWrap = document.getElementById('inv-bag-custom-wrap');
-      const customInput = document.getElementById('inv-bag-custom');
-      const countInput  = document.getElementById('inv-bags-count');
+      const customInput= document.getElementById('inv-bag-custom');
+      const countInput = document.getElementById('inv-bags-count');
 
       if (bagSizeEl) {
         bagSizeEl.addEventListener('change', () => {
@@ -433,7 +464,6 @@ const SSIInventory = (() => {
     }
   }
 
-  // ─── Compute qty from form — returns a number ───────────────
   function _getQty() {
     const mode = document.getElementById('inv-pack-mode')?.value;
     if (!mode) return 0;
@@ -450,7 +480,6 @@ const SSIInventory = (() => {
         if (bagSizeEl.value === 'custom') {
           bagSize = parseFloat(customInput?.value || 0) || 0;
         } else if (bagSizeEl.value !== '') {
-          // The value may be a string like "1 KG" or just "1"
           const raw = bagSizeEl.value.replace(/[^\d.]/g, '');
           bagSize = parseFloat(raw) || 0;
         }
@@ -470,7 +499,6 @@ const SSIInventory = (() => {
     return qty;
   }
 
-  // Update the total display
   function calcTotal() {
     const totalEl = document.getElementById('inv-total-qty');
     const uomEl   = document.getElementById('inv-total-uom');
@@ -487,7 +515,6 @@ const SSIInventory = (() => {
     totalEl.textContent = SSIApp.qtyFmt(qty);
     if (uomEl) uomEl.textContent = ' ' + uom;
 
-    // Colour feedback: red if 0, green if > 0
     const displayBox = document.getElementById('inv-total-display');
     if (displayBox) {
       if (qty > 0) {
@@ -534,13 +561,11 @@ const SSIInventory = (() => {
     const productId = document.getElementById('inv-product')?.value;
     const note      = document.getElementById('inv-note')?.value?.trim() || '';
     const mode      = document.getElementById('inv-pack-mode')?.value;
-    // ISSUE-specific fields
     const isIssue   = (type === 'ISSUE');
     const issuedEmpId  = isIssue ? (document.getElementById('inv-issued-emp')?.value || '') : '';
     const issuedName   = isIssue ? (document.getElementById('inv-issued-name')?.value?.trim() || '') : '';
     const purpose      = isIssue ? (document.getElementById('inv-purpose')?.value?.trim() || '') : '';
     const dept         = isIssue ? (document.getElementById('inv-dept')?.value?.trim() || '') : '';
-    // Validate ISSUE fields
     if (isIssue && !purpose) {
       SSIApp.toast('❌ Please enter a Purpose/Reason for the internal issue', 'error');
       return;
@@ -555,17 +580,14 @@ const SSIInventory = (() => {
       return;
     }
 
-    // Recalculate qty directly from inputs — do NOT rely on display text
     const qty = _getQty();
 
     if (qty <= 0) {
       SSIApp.toast('Quantity must be greater than 0. Please check Bag Size, Count, or KG fields.', 'error');
-      // Highlight the total box red
       calcTotal();
       return;
     }
 
-    // Check OUT doesn't exceed stock
     if (['OUT','TRANSFER_OUT','ISSUE'].includes(type)) {
       const current = SSIApp.getStock(productId, unitId);
       if (qty > current) {
@@ -578,7 +600,6 @@ const SSIInventory = (() => {
     const st   = SSIApp.getState();
     const prod = st.products.find(p=>p.id===productId);
 
-    // Resolve issued_to name: prefer employee dropdown, fallback to free text
     const st2 = SSIApp.getState();
     const issuedEmp = issuedEmpId ? (st2.employees||[]).find(e=>e.id===issuedEmpId) : null;
     const issued_to = issuedEmp ? `${issuedEmp.name} (${issuedEmp.emp_code})` : (issuedName || '');
@@ -598,9 +619,13 @@ const SSIInventory = (() => {
       department: dept,
       user_id: user?.id,
       user_name: user?.name,
-      created_at: new Date().toISOString()
+      created_at: new Date().toISOString(),
+      active: true,
+      history: []
     };
+    _addHistory(entry, 'CREATED', `${type} ${SSIApp.qtyFmt(qty)} ${prod?.uom||'KG'} — ${prod?.name||''} @ ${(st.units.find(u=>u.id===unitId)?.name)||''}`);
 
+    if (!st.inventory) st.inventory = [];
     st.inventory.push(entry);
     await SSIApp.saveState(st);
     SSIApp.toast(`✅ Entry saved: ${SSIApp.qtyFmt(qty)} ${prod?.uom||'KG'} added`);
@@ -609,28 +634,118 @@ const SSIInventory = (() => {
     refresh(document.getElementById('page-area'));
   }
 
+  /* ── Soft delete inventory entry (Admin only) ────────────── */
   async function deleteEntry(id) {
-    const ok = await SSIApp.confirm('Delete this inventory entry? Stock balance will change.');
-    if (!ok) return;
+    if (!SSIApp.hasRole('ADMIN')) { SSIApp.toast('🔒 Admin only'); return; }
     const st = SSIApp.getState();
-    st.inventory = st.inventory.filter(t => t.id !== id);
+    const t  = (st.inventory||[]).find(x => x.id === id);
+    if (!t) return;
+    const prod = (st.products||[]).find(p => p.id === t.product_id);
+    const unit = (st.units||[]).find(u => u.id === t.unit_id);
+
+    const ok = await SSIApp.confirm(
+      `⚠️ Delete Inventory Entry?\n\n` +
+      `Date: ${SSIApp.dateFmt(t.date)}\n` +
+      `Type: ${t.type}\n` +
+      `Product: ${prod?.name || '—'}\n` +
+      `Unit: ${unit?.name || '—'}\n` +
+      `Qty: ${SSIApp.qtyFmt(t.qty||0)} ${prod?.uom||'KG'}\n\n` +
+      `The entry will be marked DELETED and EXCLUDED from stock balance.\n` +
+      `It will stay in history (visible via "Show deleted") and can be restored.\n\nProceed?`
+    );
+    if (!ok) return;
+
+    t.active     = false;
+    t.deleted_at = new Date().toISOString();
+    t.deleted_by = SSIApp.state.currentUser?.username || 'unknown';
+    _addHistory(t, 'DELETED (soft)', `Removed from stock by ${t.deleted_by}`);
+
     await SSIApp.saveState(st);
-    SSIApp.toast('Entry deleted');
-    SSIApp.audit('INV_DELETE', id);
+    SSIApp.toast('🗑️ Inventory entry marked deleted');
+    SSIApp.audit('INV_SOFT_DELETE', `${t.type} ${t.qty} ${prod?.name||''} (${t.id})`);
     refresh(document.getElementById('page-area'));
+  }
+
+  /* ── Restore a soft-deleted entry ────────────────────────── */
+  async function restoreEntry(id) {
+    if (!SSIApp.hasRole('ADMIN')) { SSIApp.toast('🔒 Admin only'); return; }
+    const st = SSIApp.getState();
+    const t  = (st.inventory||[]).find(x => x.id === id);
+    if (!t) return;
+    t.active = true;
+    t.restored_at = new Date().toISOString();
+    t.restored_by = SSIApp.state.currentUser?.username || 'unknown';
+    delete t.deleted_at;
+    delete t.deleted_by;
+    _addHistory(t, 'RESTORED', `Restored by ${t.restored_by}`);
+    await SSIApp.saveState(st);
+    SSIApp.toast('♻️ Entry restored');
+    SSIApp.audit('INV_RESTORE', `${t.type} ${t.qty} (${t.id})`);
+    refresh(document.getElementById('page-area'));
+  }
+
+  /* ── View history of an entry ────────────────────────────── */
+  function viewHistory(id) {
+    const st = SSIApp.getState();
+    const t  = (st.inventory||[]).find(x => x.id === id);
+    if (!t) return;
+    const prod = (st.products||[]).find(p => p.id === t.product_id);
+    const unit = (st.units||[]).find(u => u.id === t.unit_id);
+    const items = (t.history && t.history.length) ? t.history : [];
+
+    const rowsHtml = items.map(h => `
+      <tr style="border-top:1px solid #e2e8f0;">
+        <td style="padding:6px 8px;font-size:12px;white-space:nowrap;">${SSIApp.dateFmt(h.ts)}<br><span style="color:#94a3b8;">${(h.ts||'').slice(11,19)}</span></td>
+        <td style="padding:6px 8px;font-size:12px;font-weight:700;color:#334155;">${h.action||''}</td>
+        <td style="padding:6px 8px;font-size:12px;">${h.user_name || h.user || ''}</td>
+        <td style="padding:6px 8px;font-size:12px;color:#475569;">${h.detail || ''}</td>
+      </tr>`).join('');
+
+    const html = `
+      <div class="modal-header">
+        <h3 style="font-size:18px;font-weight:700;">🕒 Inventory Entry History</h3>
+        <button onclick="SSIApp.closeModal()" style="background:none;border:none;font-size:20px;cursor:pointer;color:#64748b;">✕</button>
+      </div>
+      <div class="modal-body">
+        <div style="margin-bottom:12px;color:#64748b;font-size:13px;">
+          <strong>${t.type}</strong> — ${prod?.name||'—'} @ ${unit?.name||'—'} · ${SSIApp.qtyFmt(t.qty||0)} ${prod?.uom||'KG'} · ${SSIApp.dateFmt(t.date)}
+        </div>
+        <table style="width:100%;border-collapse:collapse;background:#fff;">
+          <thead>
+            <tr style="background:#f8fafc;">
+              <th style="text-align:left;padding:6px 8px;font-size:12px;color:#64748b;">When</th>
+              <th style="text-align:left;padding:6px 8px;font-size:12px;color:#64748b;">Action</th>
+              <th style="text-align:left;padding:6px 8px;font-size:12px;color:#64748b;">By</th>
+              <th style="text-align:left;padding:6px 8px;font-size:12px;color:#64748b;">Detail</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${items.length ? rowsHtml : `<tr><td colspan="4" style="padding:14px;color:#94a3b8;text-align:center;">No history entries.</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="SSIApp.closeModal()">Close</button>
+      </div>`;
+    SSIApp.showModal(html);
   }
 
   function exportExcel() {
     const st = SSIApp.getState();
-    const rows = [['Date','Type','Unit','Product','SKU','Pack Mode','Pack Desc','Qty','UoM','Note','Issued To','Purpose','Department','By']];
-    [...st.inventory].sort((a,b)=>new Date(b.date)-new Date(a.date)).forEach(t => {
+    const rows = [['Date','Type','Unit','Product','SKU','Pack Mode','Pack Desc','Qty','UoM','Note','Issued To','Purpose','Department','By','Status','Last Change At','Last Change By','Last Change Action']];
+    [...(st.inventory||[])].sort((a,b)=>new Date(b.date)-new Date(a.date)).forEach(t => {
       const prod = st.products.find(p=>p.id===t.product_id);
       const unit = st.units.find(u=>u.id===t.unit_id);
       const user = st.users.find(u=>u.id===t.user_id);
+      const last = (t.history && t.history.length) ? t.history[t.history.length-1] : null;
       rows.push([
         t.date, t.type, unit?.name||'', prod?.name||'', prod?.sku||'',
         t.pack_mode||'', t.pack_desc||'', t.qty||0, prod?.uom||'KG',
-        t.note||'', t.issued_to||'', t.purpose||'', t.department||'', user?.name||t.user_name||''
+        t.note||'', t.issued_to||'', t.purpose||'', t.department||'', user?.name||t.user_name||'',
+        t.active === false ? 'Deleted' : 'Active',
+        last?.ts || '',
+        last?.user_name || last?.user || '',
+        last?.action || ''
       ]);
     });
     SSIApp.excelDownload(rows, 'Inventory', 'SSI_Inventory_Ledger');
@@ -658,6 +773,13 @@ const SSIInventory = (() => {
       const rows = await SSIApp.excelRead(file);
       const st   = SSIApp.getState();
       const user = SSIApp.currentUser();
+
+      // Confirm before importing — these can be many rows
+      const ok = await SSIApp.confirm(
+        `📥 Import ${rows.length} inventory rows from this file?\n\nThis will ADD entries to the ledger (existing entries are NOT replaced).\n\nProceed?`
+      );
+      if (!ok) { input.value=''; return; }
+
       let added = 0, errors = [];
 
       rows.forEach((r, idx) => {
@@ -694,13 +816,18 @@ const SSIInventory = (() => {
         }
         if (qty <= 0) { errors.push(`Row ${idx+2}: Qty is 0 — check size/count/direct`); return; }
 
-        st.inventory.push({
+        const newEntry = {
           id: SSIApp.uid(), date: dateRaw, type: typeRaw,
           unit_id: unit.id, product_id: prod.id,
           pack_mode: packMode, pack_desc, qty, note,
           user_id: user?.id, user_name: user?.name,
-          created_at: new Date().toISOString()
-        });
+          created_at: new Date().toISOString(),
+          active: true,
+          history: []
+        };
+        _addHistory(newEntry, 'IMPORTED', `Row ${idx+2}: ${typeRaw} ${qty} ${prod.name}`);
+        if (!st.inventory) st.inventory = [];
+        st.inventory.push(newEntry);
         added++;
       });
 
@@ -717,45 +844,76 @@ const SSIInventory = (() => {
     input.value = '';
   }
 
+  /* ── Reset all inventory to zero (two-step + type-to-confirm) ── */
   async function clearInventory() {
     if (!SSIApp.hasRole('ADMIN')) return;
     const st = SSIApp.getState();
-    const count = (st.inventory||[]).length;
-    if (count === 0) { SSIApp.toast('Inventory is already empty.'); return; }
+    const all = st.inventory || [];
+    const activeCount = all.filter(t => t.active !== false).length;
+    if (activeCount === 0) { SSIApp.toast('Inventory is already empty.'); return; }
 
-    const ok = await SSIApp.confirm(
-      `⚠️ RESET INVENTORY TO ZERO?\n\nThis will permanently DELETE all ${count} inventory entries.\nOrders and dispatch records are NOT affected.\n\nThis CANNOT be undone. Continue?`
+    const ok1 = await SSIApp.confirm(
+      `⚠️ RESET INVENTORY TO ZERO?\n\nThis will mark ALL ${activeCount} active inventory entries as DELETED.\n\nThey will be excluded from stock balance but kept in history (visible via "Show deleted").\nYou can restore individual entries later.\n\nClick OK to proceed to final confirmation.`
     );
-    if (!ok) return;
+    if (!ok1) return;
 
-    // ── 1. Wipe inventory in the live state object immediately ──
-    SSIApp.state.inventory = [];
-    SSIApp.audit('INVENTORY_RESET', `All ${count} inventory entries cleared by admin`);
+    const confirmed = await _confirmTyped(
+      `Type RESET INVENTORY to confirm marking all ${activeCount} entries deleted:`,
+      'RESET INVENTORY'
+    );
+    if (!confirmed) return;
 
-    // ── 2. Persist to localStorage right away (instant, no race) ──
-    try { localStorage.setItem('ssiData', JSON.stringify(SSIApp.state)); } catch(e) {}
-
-    // ── 3. Force-write to Firestore directly, bypassing _isSaving guard ──
-    if (window.SSIFirebase && SSIFirebase.db) {
-      try {
-        const DOC = SSIFirebase.db.collection('ssi').doc('data');
-        await DOC.set(SSIApp.state);
-        // Update localStorage again after confirmed Firestore write
-        try { localStorage.setItem('ssiData', JSON.stringify(SSIApp.state)); } catch(e) {}
-      } catch(err) {
-        console.error('[ClearInventory] Firestore write failed:', err.message);
-        SSIApp.toast('⚠️ Saved locally only — sync may retry shortly');
+    const nowIso = new Date().toISOString();
+    const actor  = SSIApp.state.currentUser?.username || 'admin';
+    let count = 0;
+    all.forEach(t => {
+      if (t.active !== false) {
+        t.active     = false;
+        t.deleted_at = nowIso;
+        t.deleted_by = actor;
+        _addHistory(t, 'DELETED (reset)', `Bulk reset by ${actor}`);
+        count++;
       }
-    }
+    });
 
-    SSIApp.toast(`✅ Inventory reset — ${count} entries removed`);
+    SSIApp.audit('INVENTORY_RESET_SOFT', `Marked ${count} inventory entries deleted (kept in history)`);
+
+    // Persist via the safe SSIApp.saveState path (uses Stage 1 stale-write guard)
+    await SSIApp.saveState(st);
+
+    SSIApp.toast(`✅ Inventory reset — ${count} entries marked deleted (recoverable)`);
     refresh(document.getElementById('page-area'));
+  }
+
+  function _confirmTyped(message, expectedText) {
+    return new Promise(resolve => {
+      const html = `
+        <div class="modal-header" style="background:#7f1d1d;color:#fff;">
+          <h3 style="margin:0;font-size:16px;">⚠️ Final Confirmation Required</h3>
+          <button onclick="SSIApp.closeModal()" style="background:none;border:none;color:#fff;font-size:20px;cursor:pointer;">✕</button>
+        </div>
+        <div class="modal-body" style="padding:24px;">
+          <p style="margin:0 0 16px;color:#7f1d1d;font-weight:600;">${message}</p>
+          <input id="confirm-type-input" type="text" placeholder='Type: ${expectedText}'
+            style="border:2px solid #dc2626;border-radius:8px;padding:10px 14px;width:100%;box-sizing:border-box;font-size:15px;letter-spacing:1px;"
+            oninput="document.getElementById('confirm-type-btn').disabled = this.value.trim() !== '${expectedText}';">
+        </div>
+        <div class="modal-footer" style="justify-content:flex-end;gap:10px;">
+          <button class="btn btn-secondary" onclick="SSIApp.closeModal(); window._invResetResolve(false)">Cancel</button>
+          <button id="confirm-type-btn" class="btn btn-danger" disabled
+            onclick="SSIApp.closeModal(); window._invResetResolve(true)">
+            🗑️ Reset Inventory
+          </button>
+        </div>`;
+      window._invResetResolve = resolve;
+      SSIApp.showModal(html);
+    });
   }
 
   return {
     render, refresh, applyFilter, _onTypeChange,
     openEntryModal, onProductUnitChange, onPackModeChange, calcTotal,
-    saveEntry, deleteEntry, clearInventory,
+    saveEntry, deleteEntry, restoreEntry, viewHistory, clearInventory,
     exportExcel, downloadTemplate, importExcel
   };
 })();
