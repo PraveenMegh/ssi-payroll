@@ -1,4 +1,7 @@
-/* SSI Sales Orders Module */
+/* ============================================================
+   SSI Sales Orders Module (v2 SAFE)
+   Stage 1 Batch 2: confirmation popups + soft delete + order history timeline
+   ============================================================ */
 const SSIOrders = (() => {
   const PACK_MODES = [
     { value:'BAG',        label:'🛍️ KG Bags (Size × Count)' },
@@ -7,6 +10,18 @@ const SSIOrders = (() => {
     { value:'DIRECT_KG',  label:'⚖️ Direct KG' },
     { value:'NOS',        label:'🔢 Units / NOS' },
   ];
+
+  /* ── Helper: append a history entry to an order ────────────── */
+  function _addHistory(order, action, detail) {
+    if (!order.history) order.history = [];
+    order.history.push({
+      action,
+      detail: detail || '',
+      ts: new Date().toISOString(),
+      user: SSIApp.state.currentUser?.username || 'unknown',
+      user_name: SSIApp.state.currentUser?.name || ''
+    });
+  }
 
   function render(area) {
     if (!SSIApp.hasRole('ADMIN','SALES','ACCOUNTS')) {
@@ -47,11 +62,12 @@ const SSIOrders = (() => {
           <div style="flex:1;min-width:140px;">
             <label>Status</label>
             <select id="ord-filter-status" onchange="SSIOrders.applyFilter()">
-              <option value="">All</option>
+              <option value="">All (excl. Cancelled)</option>
               <option value="DRAFT">Draft</option>
               <option value="SUBMITTED">Submitted</option>
               <option value="DISPATCHED">Dispatched</option>
-              <option value="CANCELLED">Cancelled</option>
+              <option value="CANCELLED">Cancelled (only)</option>
+              <option value="__ALL__">Show ALL incl. Cancelled</option>
             </select>
           </div>
           <div style="flex:1;min-width:140px;">
@@ -83,6 +99,7 @@ const SSIOrders = (() => {
               <th>Ordered Value</th>
               <th style="text-align:center;">Urgent</th><th>Status</th>
               ${!isSales ? '<th>By</th>' : ''}
+              <th>Last Change</th>
               <th>Actions</th>
             </tr></thead>
             <tbody>
@@ -92,10 +109,15 @@ const SSIOrders = (() => {
                 const salesp   = st.users.find(u=>u.id===o.created_by);
                 const canEdit  = o.status==='DRAFT' && (SSIApp.hasRole('ADMIN') || o.created_by===user?.id);
                 const canCancel= (o.status==='DRAFT'||o.status==='SUBMITTED') && (SSIApp.hasRole('ADMIN')||o.created_by===user?.id);
+                const lastEntry = (o.history && o.history.length) ? o.history[o.history.length-1] : null;
+                const lastChangeCell = lastEntry
+                  ? `<span style="font-size:11px;color:#64748b;">${SSIApp.dateFmt(lastEntry.ts)}<br>${lastEntry.action}<br><span style="color:#94a3b8;">${lastEntry.user||''}</span></span>`
+                  : `<span style="font-size:11px;color:#cbd5e1;">—</span>`;
                 return `<tr data-status="${o.status}" data-sales="${o.created_by}" data-date="${o.created_at?.slice(0,10)||''}">
                   <td>
                     <strong>${o.order_no}</strong>
                     ${o.dispatch_modified ? '<br><span style="background:#fef3c7;color:#92400e;font-size:10px;padding:1px 5px;border-radius:3px;">✏️ Modified</span>' : ''}
+                    ${o.status==='CANCELLED' ? '<br><span style="background:#fee2e2;color:#991b1b;font-size:10px;padding:1px 5px;border-radius:3px;">CANCELLED</span>' : ''}
                   </td>
                   <td style="white-space:nowrap;">${SSIApp.dateFmt(o.created_at)}</td>
                   <td>
@@ -115,30 +137,40 @@ const SSIOrders = (() => {
                   <td style="text-align:center;">${o.urgent?'<span class="badge badge-urgent">🚨 YES</span>':'<span style="color:#d1d5db;">—</span>'}</td>
                   <td>${statusBadge(o)}</td>
                   ${!isSales ? `<td style="font-size:12px;color:#64748b;">${salesp?.name||'—'}</td>` : ''}
+                  <td>${lastChangeCell}</td>
                   <td style="white-space:nowrap;">
-                    <button class="btn btn-secondary btn-sm" onclick="SSIOrders.viewOrder('${o.id}')">👁️</button>
-                    ${canEdit ? `<button class="btn btn-secondary btn-sm" onclick="SSIOrders.openForm('${o.id}')">✏️</button>` : ''}
-                    ${canCancel ? `<button class="btn btn-danger btn-sm" onclick="SSIOrders.cancelOrder('${o.id}')">✕ Cancel</button>` : ''}
-                    ${SSIApp.hasRole('ADMIN') ? `<button class="btn btn-danger btn-sm" onclick="SSIOrders.deleteOrder('${o.id}')" title="Permanently delete order">🗑️</button>` : ''}
+                    <button class="btn btn-secondary btn-sm" onclick="SSIOrders.viewOrder('${o.id}')" title="View details + history">👁️</button>
+                    ${canEdit ? `<button class="btn btn-secondary btn-sm" onclick="SSIOrders.openForm('${o.id}')" title="Edit">✏️</button>` : ''}
+                    ${canCancel ? `<button class="btn btn-danger btn-sm" onclick="SSIOrders.cancelOrder('${o.id}')" title="Cancel order (kept in history)">✕ Cancel</button>` : ''}
+                    ${SSIApp.hasRole('ADMIN') && o.status==='CANCELLED' ? `<button class="btn btn-danger btn-sm" onclick="SSIOrders.deleteOrder('${o.id}')" title="Permanently delete this cancelled order">🗑️</button>` : ''}
                   </td>
                 </tr>`;
-              }).join('') || `<tr><td colspan="12" style="text-align:center;padding:40px;color:#94a3b8;">No orders yet. Create your first order!</td></tr>`}
+              }).join('') || `<tr><td colspan="13" style="text-align:center;padding:40px;color:#94a3b8;">No orders yet. Create your first order!</td></tr>`}
             </tbody>
           </table>
         </div>
         <div id="ord-count" style="margin-top:12px;font-size:13px;color:#94a3b8;">Total: ${orders.length} orders</div>
       </div>`;
+
+    // Default behavior: hide CANCELLED rows unless filter explicitly asks for them
+    setTimeout(applyFilter, 0);
   }
 
   function applyFilter() {
-    const statusF = document.getElementById('ord-filter-status')?.value || '';
+    const statusF = document.getElementById('ord-filter-status')?.value;
     const salesF  = document.getElementById('ord-filter-sales')?.value  || '';
     const fromF   = document.getElementById('ord-filter-from')?.value   || '';
     const toF     = document.getElementById('ord-filter-to')?.value     || '';
     const rows    = document.querySelectorAll('#orders-table tbody tr[data-status]');
     let visible   = 0;
     rows.forEach(row => {
-      const show = (!statusF || row.dataset.status===statusF)
+      let statusOk;
+      if (statusF === '__ALL__')      statusOk = true;
+      else if (statusF === 'CANCELLED') statusOk = (row.dataset.status === 'CANCELLED');
+      else if (!statusF)              statusOk = (row.dataset.status !== 'CANCELLED');     // default hides cancelled
+      else                            statusOk = (row.dataset.status === statusF);
+
+      const show = statusOk
         && (!salesF  || row.dataset.sales===salesF)
         && (!fromF   || row.dataset.date >= fromF)
         && (!toF     || row.dataset.date <= toF);
@@ -250,11 +282,9 @@ const SSIOrders = (() => {
       }
       return parseFloat(sel.value) || 0;
     }
-    // fallback for CARTON_MAN / CARTON_STD (plain input)
     return parseFloat(document.querySelector(`.item-size-manual[data-idx="${idx}"]`)?.value) || 0;
   }
 
-  // ── called when the size <select> changes ───────────────────────────────────
   function onItemSizeChange(idx) {
     const sel     = document.querySelector(`.item-size-sel[data-idx="${idx}"]`);
     const customI = document.querySelector(`.item-size-custom[data-idx="${idx}"]`);
@@ -266,7 +296,6 @@ const SSIOrders = (() => {
     calcItemTotal(idx);
   }
 
-  // ── build size options from a product's pack_sizes array ────────────────────
   function _buildSizeOpts(prod, selectedSize) {
     const sizes = (prod?.pack_sizes || []).map(s => {
       const m = (s + '').match(/[\d.]+/);
@@ -287,7 +316,6 @@ const SSIOrders = (() => {
     const packOpts = PACK_MODES.map(m=>`<option value="${m.value}" ${item.pack_mode===m.value?'selected':''}>${m.label}</option>`).join('');
     const mode = item.pack_mode || 'BAG';
 
-    // Size cell: BAG → dropdown; CARTON_MAN → free input; CARTON_STD → readonly input; DIRECT_KG/NOS → hidden
     const hideSize  = (mode === 'DIRECT_KG' || mode === 'NOS');
     const selectedSz= parseFloat(item.pack_size) || 0;
     const isCustom  = prod && selectedSz && !(prod.pack_sizes||[]).some(s=>{ const m=(s+'').match(/[\d.]+/); return m&&parseFloat(m[0])===selectedSz; });
@@ -362,24 +390,20 @@ const SSIOrders = (() => {
     const prod = st.products.find(p=>p.id===productId);
     if (!prod) return;
 
-    // Auto-fill rate: prefer selling_price, fallback to default_rate (MRP)
     const rateEl = document.querySelector(`.item-rate[data-idx="${idx}"]`);
     if (rateEl && !rateEl.value) {
       const autoRate = prod.selling_price || prod.default_rate || '';
       if (autoRate) rateEl.value = autoRate;
     }
 
-    // Refresh bag-size dropdown with new product's pack_sizes
     const mode   = document.querySelector(`.item-pack-mode[data-idx="${idx}"]`)?.value || 'BAG';
     const selEl  = document.querySelector(`.item-size-sel[data-idx="${idx}"]`);
     if (mode === 'BAG' && selEl) {
       selEl.innerHTML = _buildSizeOpts(prod, 0);
-      // Auto-select if only one size
       if ((prod.pack_sizes||[]).length === 1) {
         const m = (prod.pack_sizes[0]+'').match(/[\d.]+/);
         if (m) selEl.value = parseFloat(m[0]);
       }
-      // reset custom
       const customI = document.querySelector(`.item-size-custom[data-idx="${idx}"]`);
       const warnEl  = document.querySelector(`.item-size-warning[data-idx="${idx}"]`);
       if (customI) { customI.value = ''; customI.style.display = 'none'; }
@@ -402,12 +426,9 @@ const SSIOrders = (() => {
     const prod      = productId ? SSIApp.getState().products.find(p=>p.id===productId) : null;
 
     if (mode === 'BAG') {
-      // Rebuild size wrap contents to show the dropdown
       if (sizeWrap) {
-        // Replace any manual input with the select+custom+warning combo
         const existingSel = sizeWrap.querySelector('.item-size-sel');
         if (!existingSel) {
-          // Rebuild inner HTML
           sizeWrap.innerHTML = `
             <label style="font-size:12px;" id="item-size-label-${idx}">Bag Size (KG)</label>
             <select class="item-size-sel" data-idx="${idx}" onchange="SSIOrders.onItemSizeChange(${idx})" style="font-size:13px;">
@@ -420,7 +441,6 @@ const SSIOrders = (() => {
               ⚠️ Non-standard size — verify stock availability
             </div>`;
         } else {
-          // Just refresh the options
           existingSel.innerHTML = _buildSizeOpts(prod, 0);
           const customI = sizeWrap.querySelector('.item-size-custom');
           const warnEl  = sizeWrap.querySelector('.item-size-warning');
@@ -434,7 +454,6 @@ const SSIOrders = (() => {
         }
       }
     } else {
-      // CARTON_STD / CARTON_MAN — replace dropdown with plain input
       if (sizeWrap) {
         const existingManual = sizeWrap.querySelector('.item-size-manual');
         if (!existingManual) {
@@ -559,7 +578,6 @@ const SSIOrders = (() => {
     if (!items.length) { SSIApp.toast('Add at least one order item', 'error'); return; }
     if (items.some(i=>i.total_qty<=0)) { SSIApp.toast('All items must have quantity > 0', 'error'); return; }
 
-    // Warn if any BAG item uses a size not in the product's pack_sizes
     const st2 = SSIApp.getState();
     const nonStdItems = items.filter(it => {
       if (it.pack_mode !== 'BAG' || !it.pack_size) return false;
@@ -572,7 +590,7 @@ const SSIOrders = (() => {
         const p = st2.products.find(x=>x.id===it.product_id);
         return `${p?.name||it.product_id} (${it.pack_size} KG)`;
       }).join(', ');
-      const ok = confirm(`⚠️ Non-standard bag size detected:\n${names}\n\nThis size is NOT in the product's pack sizes. Continue submitting?`);
+      const ok = await SSIApp.confirm(`⚠️ Non-standard bag size detected:\n${names}\n\nThis size is NOT in the product's pack sizes. Continue submitting?`);
       if (!ok) return;
     }
 
@@ -580,22 +598,46 @@ const SSIOrders = (() => {
     const totalValue = items.reduce((s,i)=>s+(i.line_total||0), 0);
     const user       = SSIApp.currentUser();
     const st         = SSIApp.getState();
+    const nowIso     = new Date().toISOString();
 
     if (orderId) {
       const idx = st.orders.findIndex(o=>o.id===orderId);
       if (idx>=0) {
-        Object.assign(st.orders[idx], {date,unit_id:unitId,client_id:clientId,currency,urgent,remarks,items,total_qty:totalKg,total_value:totalValue,status,updated_at:new Date().toISOString()});
-        if (status==='SUBMITTED') st.orders[idx].submitted_at = new Date().toISOString();
+        const prev = st.orders[idx];
+        const prevStatus = prev.status;
+        Object.assign(prev, {
+          date, unit_id:unitId, client_id:clientId, currency, urgent, remarks, items,
+          total_qty:totalKg, total_value:totalValue, status,
+          updated_at: nowIso,
+          updated_by: user?.username || 'unknown'
+        });
+        if (status==='SUBMITTED' && prevStatus !== 'SUBMITTED') prev.submitted_at = nowIso;
+        _addHistory(prev,
+          status === 'SUBMITTED' && prevStatus !== 'SUBMITTED' ? 'SUBMITTED'
+          : (status === 'DRAFT'  && prevStatus !== 'DRAFT')    ? 'EDITED (Draft)'
+          : 'EDITED',
+          `Total ${SSIApp.qtyFmt(totalKg)} KG / ${SSIApp.moneyFmt(totalValue, currency)}`
+        );
       }
       SSIApp.toast(`Order updated (${status}) ✅`);
     } else {
       const orderNo = SSIApp.nextOrderNo(st);
-      st.orders.push({
-        id:SSIApp.uid(), order_no:orderNo, date, unit_id:unitId, client_id:clientId,
-        currency, urgent, remarks, items, total_qty:totalKg, total_value:totalValue,
-        status, created_by:user?.id, created_at:new Date().toISOString(),
-        submitted_at: status==='SUBMITTED' ? new Date().toISOString() : null
-      });
+      const newOrder = {
+        id: SSIApp.uid(),
+        order_no: orderNo,
+        date, unit_id:unitId, client_id:clientId,
+        currency, urgent, remarks, items,
+        total_qty: totalKg, total_value: totalValue,
+        status,
+        created_by: user?.id,
+        created_by_username: user?.username || '',
+        created_at: nowIso,
+        submitted_at: status==='SUBMITTED' ? nowIso : null,
+        history: []
+      };
+      _addHistory(newOrder, status === 'SUBMITTED' ? 'CREATED + SUBMITTED' : 'CREATED (Draft)',
+        `Total ${SSIApp.qtyFmt(totalKg)} KG / ${SSIApp.moneyFmt(totalValue, currency)}`);
+      st.orders.push(newOrder);
       SSIApp.toast(`Order ${orderNo} ${status==='SUBMITTED'?'submitted':'saved'} ✅`);
     }
 
@@ -616,7 +658,6 @@ const SSIOrders = (() => {
     const dispBy  = o.dispatched_by ? st.users.find(u=>u.id===o.dispatched_by) : null;
     const statusColors = {DRAFT:'#64748b',SUBMITTED:'#d97706',DISPATCHED:'#16a34a',CANCELLED:'#dc2626'};
 
-    // Build original items table
     const buildItemsTable = (items, currency, title, headerColor) => `
       <div style="margin-bottom:16px;">
         <div style="font-size:14px;font-weight:700;color:${headerColor};margin-bottom:8px;">${title}</div>
@@ -650,7 +691,6 @@ const SSIOrders = (() => {
         </table>
       </div>`;
 
-    // Comparison table for modified dispatch
     const buildComparisonTable = () => {
       if (!o.dispatch_modified || !o.dispatched_items) return '';
       return `
@@ -694,13 +734,46 @@ const SSIOrders = (() => {
         </div>`;
     };
 
+    // Order timeline (history)
+    const buildTimeline = () => {
+      const items = (o.history && o.history.length) ? o.history : [];
+      if (!items.length) return `
+        <div style="margin-top:20px;padding:14px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;">
+          <div style="font-size:14px;font-weight:700;color:#334155;margin-bottom:6px;">🕒 Order Timeline</div>
+          <div style="font-size:13px;color:#94a3b8;">No history recorded yet.</div>
+        </div>`;
+      return `
+        <div style="margin-top:20px;padding:14px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;">
+          <div style="font-size:14px;font-weight:700;color:#334155;margin-bottom:10px;">🕒 Order Timeline (${items.length} entries)</div>
+          <table style="width:100%;border-collapse:collapse;">
+            <thead>
+              <tr style="background:#fff;">
+                <th style="text-align:left;padding:6px 8px;font-size:12px;color:#64748b;">When</th>
+                <th style="text-align:left;padding:6px 8px;font-size:12px;color:#64748b;">Action</th>
+                <th style="text-align:left;padding:6px 8px;font-size:12px;color:#64748b;">By</th>
+                <th style="text-align:left;padding:6px 8px;font-size:12px;color:#64748b;">Detail</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${items.map(h => `
+                <tr style="border-top:1px solid #e2e8f0;">
+                  <td style="padding:6px 8px;font-size:12px;white-space:nowrap;">${SSIApp.dateFmt(h.ts)}<br><span style="color:#94a3b8;">${(h.ts||'').slice(11,19)}</span></td>
+                  <td style="padding:6px 8px;font-size:12px;font-weight:700;color:#334155;">${h.action||''}</td>
+                  <td style="padding:6px 8px;font-size:12px;">${h.user_name || h.user || ''}</td>
+                  <td style="padding:6px 8px;font-size:12px;color:#475569;">${h.detail || ''}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>`;
+    };
+
     const html = `
       <div class="modal-header">
-        <h3 style="font-size:18px;font-weight:700;">Order Details — ${o.order_no} ${o.urgent?'🚨':''} ${o.dispatch_modified?'<span style="background:#fef3c7;color:#92400e;font-size:13px;padding:2px 8px;border-radius:4px;">✏️ Modified</span>':''}</h3>
+        <h3 style="font-size:18px;font-weight:700;">Order Details — ${o.order_no} ${o.urgent?'🚨':''} ${o.dispatch_modified?'<span style="background:#fef3c7;color:#92400e;font-size:13px;padding:2px 8px;border-radius:4px;">✏️ Modified</span>':''} ${o.status==='CANCELLED'?'<span style="background:#fee2e2;color:#991b1b;font-size:13px;padding:2px 8px;border-radius:4px;">CANCELLED</span>':''}</h3>
         <button onclick="SSIApp.closeModal()" style="background:none;border:none;font-size:20px;cursor:pointer;color:#64748b;">✕</button>
       </div>
       <div class="modal-body">
-        <!-- Order Meta -->
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px;">
           <div class="info-card"><div style="font-size:12px;color:#64748b;">Client</div><strong>${client?.name||'—'}</strong>${client?.gst_no?`<br><span style="font-size:12px;color:#16a34a;">GST: ${client.gst_no}</span>`:''}</div>
           <div class="info-card"><div style="font-size:12px;color:#64748b;">Unit</div><strong>${unit?.name||'—'}</strong></div>
@@ -709,6 +782,7 @@ const SSIOrders = (() => {
             <span style="color:${statusColors[o.status]};font-weight:700;">${o.status}</span>
             ${o.dispatch_modified ? '<span style="background:#fef3c7;color:#92400e;font-size:10px;padding:1px 6px;border-radius:3px;margin-left:6px;">MODIFIED</span>' : ''}
             ${o.dispatched_at?`<br><span style="font-size:11px;color:#64748b;">Dispatched: ${SSIApp.dateFmt(o.dispatched_at)} by ${dispBy?.name||'—'}</span>`:''}
+            ${o.cancelled_at?`<br><span style="font-size:11px;color:#dc2626;">Cancelled: ${SSIApp.dateFmt(o.cancelled_at)} by ${o.cancelled_by||'—'}</span>`:''}
           </div>
           <div class="info-card"><div style="font-size:12px;color:#64748b;">Salesperson</div><strong>${salesp?.name||'—'}</strong></div>
           <div class="info-card"><div style="font-size:12px;color:#64748b;">Currency</div><strong>${o.currency||'INR'}</strong></div>
@@ -717,8 +791,7 @@ const SSIOrders = (() => {
         </div>
 
         ${o.dispatch_modified
-          ? `<!-- MODIFIED: Show both original and dispatched -->
-             <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+          ? `<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
                <div style="background:#fef2f2;border-radius:10px;padding:14px;border:1px solid #fca5a5;">
                  ${buildItemsTable(o.original_items||o.items, o.currency, '📋 Original Order (as submitted by Sales)', '#991b1b')}
                </div>
@@ -729,6 +802,8 @@ const SSIOrders = (() => {
              ${buildComparisonTable()}`
           : buildItemsTable(o.items, o.currency, '📋 Order Items', '#111827')
         }
+
+        ${buildTimeline()}
       </div>
       <div class="modal-footer">
         <button class="btn btn-secondary" onclick="SSIApp.closeModal()">Close</button>
@@ -737,45 +812,74 @@ const SSIOrders = (() => {
     SSIApp.showModal(html);
   }
 
+  /* ── Cancel order (soft delete: kept in history as CANCELLED) ── */
   async function cancelOrder(orderId) {
-    const ok = await SSIApp.confirm('Cancel this order?');
+    const st = SSIApp.getState();
+    const o  = st.orders.find(x=>x.id===orderId);
+    if (!o) return;
+    if (o.status === 'CANCELLED') { SSIApp.toast('Order is already cancelled', 'info'); return; }
+    if (o.status === 'DISPATCHED') { SSIApp.toast('Cannot cancel a dispatched order', 'warning'); return; }
+
+    const ok = await SSIApp.confirm(
+      `⚠️ Cancel Order ${o.order_no}?\n\n` +
+      `Status will change to CANCELLED.\n` +
+      `The order will be kept in history (you can view it via the Status filter "Cancelled (only)").\n` +
+      `Inventory will NOT be changed.\n\nProceed?`
+    );
     if (!ok) return;
-    const st  = SSIApp.getState();
-    const idx = st.orders.findIndex(o=>o.id===orderId);
-    if (idx>=0) { st.orders[idx].status='CANCELLED'; st.orders[idx].cancelled_at=new Date().toISOString(); }
-    SSIApp.saveState(st);
-    SSIApp.toast('Order cancelled');
-    SSIApp.audit('ORDER_CANCEL', orderId);
+
+    const nowIso = new Date().toISOString();
+    o.status         = 'CANCELLED';
+    o.cancelled_at   = nowIso;
+    o.cancelled_by   = SSIApp.state.currentUser?.username || 'unknown';
+    o.updated_at     = nowIso;
+    _addHistory(o, 'CANCELLED', '');
+
+    await SSIApp.saveState(st);
+    SSIApp.toast(`Order ${o.order_no} cancelled`);
+    SSIApp.audit('ORDER_CANCEL', `${o.order_no} cancelled by ${o.cancelled_by}`);
     refresh(document.getElementById('page-area'));
   }
 
-  // ── Permanently delete an order (ADMIN only) — NO inventory impact ──
+  /* ── Permanently delete an order — ADMIN, only on already-cancelled orders ── */
   async function deleteOrder(orderId) {
+    if (!SSIApp.hasRole('ADMIN')) { SSIApp.toast('🔒 Admin only'); return; }
     const st = SSIApp.getState();
     const o  = st.orders.find(x=>x.id===orderId);
     if (!o) return;
 
-    const ok = await SSIApp.confirm(
-      `Permanently DELETE order ${o.order_no}?\n\nThis cannot be undone.\nInventory will NOT be changed.`
+    if (o.status !== 'CANCELLED') {
+      SSIApp.toast('Cancel the order first before permanently deleting', 'warning');
+      return;
+    }
+
+    const ok1 = await SSIApp.confirm(
+      `⚠️ PERMANENTLY DELETE order ${o.order_no}?\n\n` +
+      `This order is already CANCELLED. Deleting it will remove the record entirely from the system.\n` +
+      `The audit log will keep a trace of the deletion.\n\nProceed to step 2 of 2?`
     );
-    if (!ok) return;
+    if (!ok1) return;
 
-    // Remove only the order record — inventory remains untouched
+    const ok2 = await SSIApp.confirm(
+      `🚨 FINAL CONFIRMATION\n\nOrder ${o.order_no} will be permanently removed.\nThis cannot be undone.\n\nClick OK to confirm.`
+    );
+    if (!ok2) return;
+
     st.orders = st.orders.filter(x=>x.id!==orderId);
-
-    SSIApp.saveState(st);
-    SSIApp.toast(`Order ${o.order_no} deleted ✅`);
-    SSIApp.audit('ORDER_DELETE', `${o.order_no} deleted by admin (no inventory change)`);
+    await SSIApp.saveState(st);
+    SSIApp.toast(`Order ${o.order_no} permanently deleted ✅`);
+    SSIApp.audit('ORDER_DELETE', `${o.order_no} permanently deleted by ${SSIApp.state.currentUser?.username || 'admin'} (no inventory change)`);
     refresh(document.getElementById('page-area'));
   }
 
   function exportExcel() {
     const st   = SSIApp.getState();
-    const rows = [['Order #','Date','Client','GST No','Unit','Ordered KG','Dispatched KG','Ordered Value','Dispatched Value','Currency','Urgent','Status','Modified?','Salesperson','Dispatch Note','Remarks']];
+    const rows = [['Order #','Date','Client','GST No','Unit','Ordered KG','Dispatched KG','Ordered Value','Dispatched Value','Currency','Urgent','Status','Modified?','Salesperson','Dispatch Note','Remarks','Last Change At','Last Change By','Last Change Action']];
     st.orders.forEach(o => {
       const client = st.clients.find(c=>c.id===o.client_id);
       const unit   = st.units.find(u=>u.id===o.unit_id);
       const salesp = st.users.find(u=>u.id===o.created_by);
+      const last   = (o.history && o.history.length) ? o.history[o.history.length-1] : null;
       rows.push([
         o.order_no, o.date, client?.name||'', client?.gst_no||'', unit?.name||'',
         o.total_qty||0,
@@ -788,7 +892,10 @@ const SSIOrders = (() => {
         o.dispatch_modified ? 'YES' : 'NO',
         salesp?.name||'',
         o.dispatch_note||'',
-        o.remarks||''
+        o.remarks||'',
+        last?.ts || '',
+        last?.user_name || last?.user || '',
+        last?.action || ''
       ]);
     });
     SSIApp.excelDownload(rows, 'Orders', 'SSI_Orders_Export');
