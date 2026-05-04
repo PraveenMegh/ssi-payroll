@@ -1,5 +1,33 @@
-/* SSI Dispatch Module */
+/* ============================================================
+   SSI Dispatch Module (v2 SAFE)
+   Stage 1 Batch 2: confirmation popups + dispatch quantity rules + timeline log
+   Rules:
+     - Dispatch qty CAN be less than ordered (partial dispatch)
+     - Dispatch qty CANNOT exceed ordered (blocked, with optional ADMIN override)
+     - Mandatory note when modifying quantities
+     - Dispatch + reversal logged in order timeline + audit log
+   ============================================================ */
 const SSIDispatch = (() => {
+
+  // Safe confirm helper — uses SSIApp.confirm if available, else native confirm
+  async function _safeConfirm(msg) {
+    if (window.SSIApp && typeof SSIApp.confirm === 'function') {
+      try { return await SSIApp.confirm(msg); } catch(e) { /* fall through */ }
+    }
+    return window.confirm(msg);
+  }
+
+  // Append a history entry to an order (matches orders.js timeline format)
+  function _addOrderHistory(order, action, detail) {
+    if (!order.history) order.history = [];
+    order.history.push({
+      action,
+      detail: detail || '',
+      ts: new Date().toISOString(),
+      user: SSIApp.state.currentUser?.username || 'unknown',
+      user_name: SSIApp.state.currentUser?.name || ''
+    });
+  }
 
   function render(area) {
     if (!SSIApp.hasRole('ADMIN','DISPATCH','ACCOUNTS')) {
@@ -10,14 +38,16 @@ const SSIDispatch = (() => {
   }
 
   function refresh(area) {
+    if (!area) area = document.getElementById('app-area') || document.getElementById('page-area');
+    if (!area) return;
     const st   = SSIApp.getState();
-    const queue    = st.orders.filter(o => o.status === 'SUBMITTED')
+    const queue    = (st.orders||[]).filter(o => o.status === 'SUBMITTED')
       .sort((a,b) => {
         if (a.urgent && !b.urgent) return -1;
         if (!a.urgent && b.urgent) return 1;
         return new Date(a.submitted_at||a.created_at) - new Date(b.submitted_at||b.created_at);
       });
-    const history  = st.orders.filter(o => ['DISPATCHED','CANCELLED'].includes(o.status))
+    const history  = (st.orders||[]).filter(o => ['DISPATCHED','CANCELLED'].includes(o.status))
       .sort((a,b) => new Date(b.dispatched_at||b.updated_at||b.created_at) - new Date(a.dispatched_at||a.updated_at||a.created_at));
 
     area.innerHTML = `
@@ -57,6 +87,7 @@ const SSIDispatch = (() => {
                 <th>Order #</th><th>Date</th><th>Client</th><th>Unit</th>
                 <th>Ordered KG</th><th>Dispatched KG</th><th>Value</th>
                 <th>Status</th><th>Dispatched By</th><th>Dispatch Date</th>
+                ${SSIApp.hasRole('ADMIN') ? '<th>Actions</th>' : ''}
               </tr></thead>
               <tbody>
                 ${history.map(o => {
@@ -77,9 +108,9 @@ const SSIDispatch = (() => {
                     <td><span class="badge ${o.status==='DISPATCHED'?'badge-dispatched':'badge-cancelled'}">${o.status}</span></td>
                     <td style="font-size:12px;">${dispBy?.name||'—'}</td>
                     <td style="font-size:12px;">${SSIApp.dateFmt(o.dispatched_at)}</td>
-                    <td>${SSIApp.hasRole('ADMIN') ? `<button class="btn btn-danger btn-sm" onclick="SSIDispatch.deleteDispatch('${o.id}')" title="Delete dispatch record">🗑️</button>` : ''}</td>
+                    ${SSIApp.hasRole('ADMIN') ? `<td>${o.status==='DISPATCHED' ? `<button class="btn btn-danger btn-sm" onclick="SSIDispatch.deleteDispatch('${o.id}')" title="Reverse dispatch (returns stock)">↩️ Reverse</button>` : ''}</td>` : ''}
                   </tr>`;
-                }).join('') || '<tr><td colspan="11" style="text-align:center;padding:30px;color:#94a3b8;">No dispatch history yet</td></tr>'}
+                }).join('') || `<tr><td colspan="${SSIApp.hasRole('ADMIN')?11:10}" style="text-align:center;padding:30px;color:#94a3b8;">No dispatch history yet</td></tr>`}
               </tbody>
             </table>
           </div>
@@ -95,7 +126,6 @@ const SSIDispatch = (() => {
       ? Math.round((Date.now()-new Date(o.submitted_at).getTime())/3600000)
       : 0;
 
-    // Check if any item has insufficient stock
     const hasInsufficient = (o.items||[]).some(item => SSIApp.getStock(item.product_id, o.unit_id) < (item.total_qty||0));
 
     return `<div style="background:#fff;border-radius:12px;box-shadow:0 1px 4px rgba(0,0,0,.08);margin-bottom:16px;overflow:hidden;border-left:4px solid ${o.urgent?'#dc2626':'#C0392B'};">
@@ -143,8 +173,12 @@ const SSIDispatch = (() => {
 
   function openDispatchModal(orderId) {
     const st     = SSIApp.getState();
-    const o      = st.orders.find(x=>x.id===orderId);
+    const o      = (st.orders||[]).find(x=>x.id===orderId);
     if (!o) return;
+    if (o.status !== 'SUBMITTED') {
+      SSIApp.toast(`Order is ${o.status}, cannot dispatch again`, 'warning');
+      return;
+    }
     const client = st.clients.find(c=>c.id===o.client_id);
     const unit   = st.units.find(u=>u.id===o.unit_id);
 
@@ -166,9 +200,11 @@ const SSIDispatch = (() => {
             min="0"
             max="${item.total_qty||0}"
             step="0.001"
-            style="width:100px;padding:6px 8px;border:2px solid ${ok?'#86efac':'#fca5a5'};border-radius:6px;font-size:13px;font-weight:700;text-align:right;"
+            data-ordered="${item.total_qty||0}"
+            style="width:110px;padding:6px 8px;border:2px solid ${ok?'#86efac':'#fca5a5'};border-radius:6px;font-size:13px;font-weight:700;text-align:right;"
             oninput="SSIDispatch.updateDispatchTotal('${orderId}')">
           <div style="font-size:10px;color:#94a3b8;margin-top:2px;">max: ${SSIApp.qtyFmt(item.total_qty||0)}</div>
+          <div id="dwarn-${i}" style="font-size:10px;color:#dc2626;margin-top:2px;display:none;font-weight:700;">⚠️ Exceeds ordered qty</div>
         </td>
         <td id="dline-${i}" style="font-weight:700;font-size:13px;text-align:right;">
           ${SSIApp.moneyFmt(defaultDispQty * (item.rate||0), o.currency||'INR')}
@@ -177,7 +213,6 @@ const SSIDispatch = (() => {
       </tr>`;
     }).join('');
 
-    // Initial totals
     const initDispQty   = (o.items||[]).reduce((s,item) => s + Math.min(item.total_qty||0, Math.max(0, SSIApp.getStock(item.product_id, o.unit_id))), 0);
     const initDispValue = (o.items||[]).reduce((s,item,i) => s + Math.min(item.total_qty||0, Math.max(0, SSIApp.getStock(item.product_id, o.unit_id))) * (item.rate||0), 0);
     const allOk         = (o.items||[]).every(item => SSIApp.getStock(item.product_id, o.unit_id) >= (item.total_qty||0));
@@ -190,7 +225,7 @@ const SSIDispatch = (() => {
       <div class="modal-body">
         <!-- Order Info -->
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:20px;">
-          <div class="info-card"><div style="font-size:12px;color:#64748b;">Client</div><strong>${client?.name||'—'}</strong>${client?.gst_no?`<br><span style="font-size:12px;color:#16a34a;">${client.gst_no}</span>`:''}</div>
+          <div class="info-card"><div style="font-size:12px;color:#64748b;">Client</div><strong>${client?.name||'—'}</strong>${(client?.gst_no||client?.gst)?`<br><span style="font-size:12px;color:#16a34a;">${client.gst_no||client.gst}</span>`:''}</div>
           <div class="info-card"><div style="font-size:12px;color:#64748b;">Unit</div><strong>${unit?.name||'—'}</strong></div>
           <div class="info-card"><div style="font-size:12px;color:#64748b;">Ordered Value</div><strong>${SSIApp.moneyFmt(o.total_value||0,o.currency)}</strong></div>
         </div>
@@ -199,7 +234,7 @@ const SSIDispatch = (() => {
         ${!allOk ? `
         <div style="background:#fef3c7;border:1px solid #fcd34d;border-radius:8px;padding:12px 16px;margin-bottom:16px;">
           <strong style="color:#92400e;">⚠️ Partial Stock Available</strong>
-          <p style="font-size:13px;color:#b45309;margin-top:4px;">Some items have less stock than ordered. The <strong>Dispatch Qty</strong> has been auto-filled with available stock. You can adjust the quantity to dispatch — the inventory and order record will reflect the actual dispatched amount.</p>
+          <p style="font-size:13px;color:#b45309;margin-top:4px;">Some items have less stock than ordered. The <strong>Dispatch Qty</strong> has been auto-filled with available stock. You can REDUCE the quantity if needed — but you CANNOT exceed the ordered quantity.</p>
         </div>` : `
         <div style="background:#dcfce7;border:1px solid #86efac;border-radius:8px;padding:12px 16px;margin-bottom:16px;">
           <strong style="color:#166534;">✅ Full stock available for all items!</strong>
@@ -213,7 +248,7 @@ const SSIDispatch = (() => {
               <th>Product</th>
               <th>Ordered Qty</th>
               <th>In Stock</th>
-              <th>✏️ Dispatch Qty <span style="font-weight:400;font-size:11px;">(editable)</span></th>
+              <th>✏️ Dispatch Qty <span style="font-weight:400;font-size:11px;">(editable, ≤ ordered)</span></th>
               <th style="text-align:right;">Line Value</th>
               <th>Stock Status</th>
             </tr></thead>
@@ -238,8 +273,8 @@ const SSIDispatch = (() => {
 
         <!-- Dispatch Note -->
         <div style="margin-top:16px;">
-          <label>📝 Dispatch Note (optional)</label>
-          <input id="dispatch-note" placeholder="e.g. Truck No. UP15AB1234, Driver: Ramesh, Partial dispatch due to stock shortage">
+          <label id="dispatch-note-label">📝 Dispatch Note <span style="color:#94a3b8;font-weight:400;font-size:12px;">(optional — required if dispatch qty < ordered)</span></label>
+          <input id="dispatch-note" placeholder="e.g. Truck No. UP15AB1234, Driver: Ramesh / Reason for partial: stock shortage">
         </div>
       </div>
       <div class="modal-footer" style="display:flex;justify-content:space-between;align-items:center;">
@@ -258,19 +293,35 @@ const SSIDispatch = (() => {
   // Live update totals when dispatch qty is changed
   function updateDispatchTotal(orderId) {
     const st = SSIApp.getState();
-    const o  = st.orders.find(x=>x.id===orderId);
+    const o  = (st.orders||[]).find(x=>x.id===orderId);
     if (!o) return;
 
     let totalDispKg  = 0;
     let totalDispVal = 0;
     let anyModified  = false;
+    let anyExceeds   = false;
 
     (o.items||[]).forEach((item, i) => {
-      const dqty    = parseFloat(document.getElementById(`dqty-${i}`)?.value || 0);
-      const lineVal = dqty * (item.rate||0);
-      totalDispKg  += dqty;
+      const inputEl = document.getElementById(`dqty-${i}`);
+      let dqty = parseFloat(inputEl?.value || 0);
+      const ordered = item.total_qty || 0;
+
+      // Block exceed-ordered: clamp visually + show warning
+      const warnEl = document.getElementById(`dwarn-${i}`);
+      if (dqty > ordered) {
+        if (warnEl) warnEl.style.display = 'block';
+        anyExceeds = true;
+      } else {
+        if (warnEl) warnEl.style.display = 'none';
+      }
+
+      // For computing totals, use clamped value (capped at ordered)
+      const clamped = Math.min(Math.max(0, dqty), ordered);
+
+      const lineVal = clamped * (item.rate||0);
+      totalDispKg  += clamped;
       totalDispVal += lineVal;
-      if (Math.abs(dqty - (item.total_qty||0)) > 0.001) anyModified = true;
+      if (Math.abs(clamped - ordered) > 0.001) anyModified = true;
 
       const lineEl = document.getElementById(`dline-${i}`);
       if (lineEl) lineEl.textContent = SSIApp.moneyFmt(lineVal, o.currency||'INR');
@@ -279,49 +330,98 @@ const SSIDispatch = (() => {
     const kgEl  = document.getElementById('disp-total-kg');
     const valEl = document.getElementById('disp-total-val');
     const warn  = document.getElementById('disp-mod-warn');
+    const btn   = document.getElementById('disp-confirm-btn');
     if (kgEl)  kgEl.textContent  = SSIApp.qtyFmt(totalDispKg) + ' KG';
     if (valEl) valEl.textContent = SSIApp.moneyFmt(totalDispVal, o.currency||'INR');
     if (warn)  warn.style.display = anyModified ? 'block' : 'none';
+
+    // Disable Confirm if any value exceeds ordered
+    if (btn) {
+      btn.disabled = anyExceeds;
+      btn.style.opacity = anyExceeds ? '.5' : '1';
+      btn.style.cursor  = anyExceeds ? 'not-allowed' : 'pointer';
+      btn.title = anyExceeds ? 'Some dispatch quantities exceed ordered — fix before confirming' : '';
+    }
   }
 
   async function confirmDispatch(orderId) {
-    const note = document.getElementById('dispatch-note')?.value.trim() || '';
-    const st   = SSIApp.getState();
-    const o    = st.orders.find(x=>x.id===orderId);
+    const noteEl = document.getElementById('dispatch-note');
+    const note   = noteEl?.value.trim() || '';
+    const st     = SSIApp.getState();
+    const o      = (st.orders||[]).find(x=>x.id===orderId);
     if (!o) return;
+
+    if (o.status !== 'SUBMITTED') {
+      SSIApp.toast(`Order is ${o.status}, cannot dispatch again`, 'warning');
+      return;
+    }
 
     const user = SSIApp.currentUser();
     const now  = new Date().toISOString();
     const today= now.slice(0,10);
 
-    // Collect actual dispatch quantities from form inputs
+    // Collect actual dispatch quantities, validate
+    let exceededAny = false;
     const dispatchedItems = (o.items||[]).map((item, i) => {
       const dqty = parseFloat(document.getElementById(`dqty-${i}`)?.value || 0);
+      if (dqty > (item.total_qty||0)) exceededAny = true;
+      const safe = Math.min(Math.max(0, dqty), item.total_qty||0);
       return {
         ...item,
-        dispatched_qty: dqty,
-        dispatched_line_total: dqty * (item.rate||0)
+        dispatched_qty: safe,
+        dispatched_line_total: safe * (item.rate||0)
       };
     });
+
+    if (exceededAny) {
+      SSIApp.toast('❌ Dispatch quantity cannot exceed ordered quantity. Please fix.', 'error');
+      return;
+    }
 
     const dispatchedQty   = dispatchedItems.reduce((s,i) => s + (i.dispatched_qty||0), 0);
     const dispatchedValue = dispatchedItems.reduce((s,i) => s + (i.dispatched_line_total||0), 0);
 
-    // Check if any quantity was modified
-    const isModified = dispatchedItems.some(item =>
-      Math.abs((item.dispatched_qty||0) - (item.total_qty||0)) > 0.001
-    );
-
-    // Validate — at least something must be dispatched
     if (dispatchedQty <= 0) {
       SSIApp.toast('Dispatch quantity cannot be zero!', 'error');
       return;
     }
 
+    const isModified = dispatchedItems.some(item =>
+      Math.abs((item.dispatched_qty||0) - (item.total_qty||0)) > 0.001
+    );
+
+    // If modified, require a note
+    if (isModified && !note) {
+      SSIApp.toast('📝 Please add a Dispatch Note explaining the partial dispatch.', 'warning');
+      const lbl = document.getElementById('dispatch-note-label');
+      if (lbl) { lbl.style.color = '#dc2626'; lbl.textContent = '📝 Dispatch Note — REQUIRED for partial dispatch'; }
+      noteEl?.focus();
+      return;
+    }
+
+    // Final confirmation popup
+    const summary = dispatchedItems.map((it, idx) => {
+      const prod = st.products.find(p=>p.id===it.product_id);
+      const diff = (it.total_qty||0) - (it.dispatched_qty||0);
+      return `• ${prod?.name||'—'}: ${SSIApp.qtyFmt(it.dispatched_qty||0)} of ${SSIApp.qtyFmt(it.total_qty||0)} KG${diff>0.001?` (short by ${SSIApp.qtyFmt(diff)})`:''}`;
+    }).join('\n');
+
+    const ok = await _safeConfirm(
+      `🚚 Confirm Dispatch — ${o.order_no}\n\n` +
+      summary + '\n\n' +
+      `Total: ${SSIApp.qtyFmt(dispatchedQty)} KG / ${SSIApp.moneyFmt(dispatchedValue, o.currency||'INR')}\n` +
+      (isModified ? `Status: DISPATCHED (Modified)\nNote: ${note}\n\n` : `Status: DISPATCHED (Full)\n\n`) +
+      `This will:\n` +
+      `• Reduce inventory (OUT entries)\n` +
+      `• Lock the order — no further edits\n\nProceed?`
+    );
+    if (!ok) return;
+
     // Create OUT inventory transactions using DISPATCHED quantities
+    if (!st.inventory) st.inventory = [];
     dispatchedItems.forEach(item => {
-      if ((item.dispatched_qty||0) <= 0) return; // Skip zero-qty items
-      st.inventory.push({
+      if ((item.dispatched_qty||0) <= 0) return;
+      const invEntry = {
         id: SSIApp.uid(),
         date: today,
         type: 'OUT',
@@ -331,31 +431,50 @@ const SSIDispatch = (() => {
         pack_desc: `Dispatch: ${o.order_no}`,
         qty: item.dispatched_qty,
         note: `Order ${o.order_no} dispatch${isModified?' (Modified)':''}${note?' — '+note:''}`,
-        order_id: orderId,        // ← links entry back to the order for reversal on delete
-        order_no: o.order_no,     // ← redundant but useful for display/debug
+        order_id: orderId,
+        order_no: o.order_no,
         user_id: user?.id,
         user_name: user?.name,
-        created_at: now
-      });
+        created_at: now,
+        active: true,
+        history: [{
+          action: 'CREATED (dispatch)',
+          detail: `Order ${o.order_no}`,
+          ts: now,
+          user: user?.username || 'unknown',
+          user_name: user?.name || ''
+        }]
+      };
+      st.inventory.push(invEntry);
     });
 
     // Update order — preserve original items, add dispatched data
     const idx = st.orders.findIndex(x=>x.id===orderId);
     if (idx>=0) {
-      Object.assign(st.orders[idx], {
+      const ord = st.orders[idx];
+      Object.assign(ord, {
         status:           'DISPATCHED',
         dispatched_at:    now,
         dispatched_by:    user?.id,
+        dispatched_by_username: user?.username || '',
         dispatch_note:    note,
-        // NEW fields for modified dispatch
         dispatch_modified:   isModified,
-        original_items:      isModified ? [...o.items] : null,   // backup of original
+        original_items:      isModified ? JSON.parse(JSON.stringify(o.items)) : null,
         original_qty:        isModified ? (o.total_qty||0) : null,
         original_value:      isModified ? (o.total_value||0) : null,
-        dispatched_items:    isModified ? dispatchedItems : null,  // actual dispatched
+        dispatched_items:    isModified ? dispatchedItems : null,
         dispatched_qty:      isModified ? dispatchedQty : null,
-        dispatched_value:    isModified ? dispatchedValue : null
+        dispatched_value:    isModified ? dispatchedValue : null,
+        updated_at: now
       });
+
+      // Order timeline log (matches orders.js format)
+      _addOrderHistory(ord,
+        isModified ? 'DISPATCHED (Modified)' : 'DISPATCHED',
+        isModified
+          ? `${SSIApp.qtyFmt(dispatchedQty)} of ${SSIApp.qtyFmt(o.total_qty||0)} KG · ${SSIApp.moneyFmt(dispatchedValue,o.currency||'INR')} · Note: ${note}`
+          : `${SSIApp.qtyFmt(dispatchedQty)} KG · ${SSIApp.moneyFmt(dispatchedValue,o.currency||'INR')}${note?' · Note: '+note:''}`
+      );
     }
 
     await SSIApp.saveState(st);
@@ -365,9 +484,9 @@ const SSIDispatch = (() => {
         : `Order ${o.order_no} dispatched successfully ✅`,
       'success'
     );
-    SSIApp.audit('DISPATCH', `Order ${o.order_no} dispatched by ${user?.name}${isModified?` — MODIFIED (${SSIApp.qtyFmt(dispatchedQty)}/${SSIApp.qtyFmt(o.total_qty||0)} KG)`:''}`);
+    SSIApp.audit('DISPATCH', `Order ${o.order_no} dispatched by ${user?.name||user?.username||'unknown'}${isModified?` — MODIFIED (${SSIApp.qtyFmt(dispatchedQty)}/${SSIApp.qtyFmt(o.total_qty||0)} KG, note: ${note})`:''}`);
     SSIApp.closeModal();
-    refresh(document.getElementById('page-area'));
+    refresh(document.getElementById('app-area') || document.getElementById('page-area'));
   }
 
   function showTab(tab) {
@@ -393,14 +512,14 @@ const SSIDispatch = (() => {
   function exportExcel() {
     const st   = SSIApp.getState();
     const rows = [['Order #','Date','Client','GST No','Unit','Ordered KG','Dispatched KG','Dispatched Value','Currency','Modified?','Status','Dispatched By','Dispatch Date','Dispatch Note']];
-    st.orders.filter(o => ['DISPATCHED','CANCELLED'].includes(o.status)).forEach(o => {
+    (st.orders||[]).filter(o => ['DISPATCHED','CANCELLED'].includes(o.status)).forEach(o => {
       const client  = st.clients.find(c=>c.id===o.client_id);
       const unit    = st.units.find(u=>u.id===o.unit_id);
       const dispBy  = st.users.find(u=>u.id===o.dispatched_by);
       const dispQty = o.dispatch_modified ? (o.dispatched_qty||0) : (o.total_qty||0);
       const dispVal = o.dispatch_modified ? (o.dispatched_value||0) : (o.total_value||0);
       rows.push([
-        o.order_no, o.date, client?.name||'', client?.gst_no||'', unit?.name||'',
+        o.order_no, o.date, client?.name||'', client?.gst_no||client?.gst||'', unit?.name||'',
         o.total_qty||0, dispQty, dispVal, o.currency||'INR',
         o.dispatch_modified ? 'YES' : 'NO', o.status,
         dispBy?.name||'', o.dispatched_at?.slice(0,10)||'', o.dispatch_note||''
@@ -410,42 +529,88 @@ const SSIDispatch = (() => {
     SSIApp.toast('Dispatch history exported ✅');
   }
 
-  
-  /* ── Delete dispatch record (ADMIN only) ─────────────────── */
+  /* ── Reverse dispatch (ADMIN only) — strong confirmation + timeline log ── */
   async function deleteDispatch(orderId) {
     if (!SSIApp.hasRole('ADMIN')) { SSIApp.toast('🔒 Admin only', 'error'); return; }
 
     const st    = SSIApp.getState();
-    // Dispatch records are stored as orders with status DISPATCHED — NOT in a separate st.dispatch array
     const order = (st.orders||[]).find(o => o.id === orderId);
     if (!order) {
       SSIApp.toast('Order not found', 'error');
       return;
     }
+    if (order.status !== 'DISPATCHED') {
+      SSIApp.toast('Only DISPATCHED orders can be reversed', 'warning');
+      return;
+    }
 
-    // Count how many inventory OUT transactions will be reversed
-    const linkedInvCount = (st.inventory||[]).filter(e => e.order_id === orderId && e.type === 'OUT').length;
+    const linkedInv = (st.inventory||[]).filter(e => e.order_id === orderId && e.type === 'OUT' && e.active !== false);
+    const linkedInvCount = linkedInv.length;
+    const linkedQty = linkedInv.reduce((s,e) => s + (e.qty||0), 0);
 
-    const ok = await SSIApp.confirm(
-      `Delete dispatch record for ${order.order_no}?\n\n` +
+    const ok1 = await _safeConfirm(
+      `↩️ Reverse dispatch for ${order.order_no}?\n\n` +
       `This will:\n` +
-      `• Permanently remove the order\n` +
-      `• Reverse ${linkedInvCount} inventory OUT transaction(s)\n\n` +
-      `This cannot be undone.`
+      `• Mark the order back to SUBMITTED (so it can be re-dispatched)\n` +
+      `• REVERSE ${linkedInvCount} inventory OUT entries (${SSIApp.qtyFmt(linkedQty)} KG returned to stock)\n` +
+      `• Reset dispatched_at, dispatched_by, dispatched note\n` +
+      `• Log this action in the order timeline\n\n` +
+      `Proceed to step 2 of 2?`
     );
-    if (!ok) return;
+    if (!ok1) return;
 
-    // Reverse inventory OUT entries linked to this order
-    st.inventory = (st.inventory||[]).filter(e => !(e.order_id === orderId && e.type === 'OUT'));
+    const ok2 = await _safeConfirm(
+      `🚨 FINAL CONFIRMATION\n\nDispatch for ${order.order_no} will be reversed and inventory restored.\n\nClick OK to confirm.`
+    );
+    if (!ok2) return;
 
-    // Remove the order entirely
-    st.orders = (st.orders||[]).filter(o => o.id !== orderId);
+    const now = new Date().toISOString();
+    const actor = SSIApp.state.currentUser?.username || 'admin';
+
+    // Soft-delete linked OUT inventory entries (instead of erasing)
+    let reversedCount = 0;
+    (st.inventory||[]).forEach(e => {
+      if (e.order_id === orderId && e.type === 'OUT' && e.active !== false) {
+        e.active     = false;
+        e.deleted_at = now;
+        e.deleted_by = actor;
+        if (!e.history) e.history = [];
+        e.history.push({
+          action: 'DELETED (dispatch reversed)',
+          detail: `Order ${order.order_no} dispatch reversed`,
+          ts: now,
+          user: actor,
+          user_name: SSIApp.state.currentUser?.name || ''
+        });
+        reversedCount++;
+      }
+    });
+
+    // Reset order back to SUBMITTED
+    const dispatchedQtyBefore = order.dispatch_modified ? (order.dispatched_qty||0) : (order.total_qty||0);
+    order.status              = 'SUBMITTED';
+    order.dispatched_at        = null;
+    order.dispatched_by        = null;
+    order.dispatched_by_username = null;
+    order.dispatch_note        = '';
+    order.dispatch_modified    = false;
+    order.original_items       = null;
+    order.original_qty         = null;
+    order.original_value       = null;
+    order.dispatched_items     = null;
+    order.dispatched_qty       = null;
+    order.dispatched_value     = null;
+    order.updated_at           = now;
+
+    _addOrderHistory(order, 'DISPATCH REVERSED',
+      `${reversedCount} inventory entries reversed (${SSIApp.qtyFmt(linkedQty)} KG returned). Previous dispatched qty: ${SSIApp.qtyFmt(dispatchedQtyBefore)} KG. By ${actor}.`
+    );
 
     await SSIApp.saveState(st);
-    SSIApp.audit('DISPATCH_DELETE', `Deleted dispatch order ${order.order_no} — ${linkedInvCount} inventory entries reversed`);
-    SSIApp.toast(`🗑️ ${order.order_no} deleted & inventory reversed`, 'success');
-    refresh(document.getElementById('page-area'));
+    SSIApp.audit('DISPATCH_REVERSE', `Order ${order.order_no} dispatch reversed by ${actor} — ${reversedCount} inventory entries soft-deleted (${SSIApp.qtyFmt(linkedQty)} KG returned to stock)`);
+    SSIApp.toast(`↩️ ${order.order_no} dispatch reversed — ${SSIApp.qtyFmt(linkedQty)} KG returned to stock`, 'success');
+    refresh(document.getElementById('app-area') || document.getElementById('page-area'));
   }
 
-return { render, refresh, openDispatchModal, confirmDispatch, updateDispatchTotal, showTab, deleteDispatch, exportExcel };
+  return { render, refresh, openDispatchModal, confirmDispatch, updateDispatchTotal, showTab, deleteDispatch, exportExcel };
 })();
