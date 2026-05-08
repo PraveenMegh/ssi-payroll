@@ -10,6 +10,11 @@
    Advance  = manual entry per payroll record
    Staff:   up to 2 paid leaves counted as Present
    Workers: overtime eligible, no paid leaves
+
+   FIX (this version):
+   - All numeric values now rounded to 2 decimals at calculation
+     and at display, eliminating long floating-point tails like
+     21.529999999999998 → 21.53.
    ============================================================ */
 const SSIPayroll = (() => {
 
@@ -17,6 +22,11 @@ const SSIPayroll = (() => {
   const EPF_RATE  = 0.12;    // 12% employer EPF on basic
   const ESI_RATE  = 0.0075;  // 0.75% employee ESI on gross
   const ESI_LIMIT = 21000;   // ESI not applicable above ₹21,000 gross
+
+  /* ── Round helper — guarantees 2 decimals everywhere ───── */
+  function _r2(n) {
+    return Math.round((Number(n) || 0) * 100) / 100;
+  }
 
   /* ── Employee lookup helper (3-tier: id → emp_code → null) ─
      Handles the case where employees were deleted and re-imported
@@ -55,13 +65,12 @@ const SSIPayroll = (() => {
     emps.forEach(e => { empById[e.id] = e; });
 
     // Build: salary → [employees] for matching heuristic
-    // Try monthly_salary, then bank+cash total
     const empBySal = {};
     emps.forEach(e => {
       const sal1 = e.monthly_salary || 0;
       const sal2 = (e.bank_salary||0) + (e.cash_salary||0);
       const sal  = sal1 > 0 ? sal1 : sal2;
-      if (sal <= 0) return; // skip ₹0 salary employees (can't match)
+      if (sal <= 0) return;
       if (!empBySal[sal]) empBySal[sal] = [];
       empBySal[sal].push(e);
     });
@@ -72,32 +81,29 @@ const SSIPayroll = (() => {
           .map(p => p.emp_id)
     );
 
-    if (!brokenIds.size) return; // Nothing to repair
+    if (!brokenIds.size) return;
 
-    // For each broken emp_id, collect all payroll records to determine salary
-    const brokenMap = {}; // emp_id → { salary, type }
+    const brokenMap = {};
     recs.forEach(p => {
       if (!brokenIds.has(p.emp_id)) return;
       if (!brokenMap[p.emp_id]) brokenMap[p.emp_id] = { salary: p.monthly_salary, recs: [] };
       brokenMap[p.emp_id].recs.push(p);
     });
 
-    // Track which employees are already matched (avoid double-linking)
     const matchedEmpIds = new Set(recs.filter(p => empById[p.emp_id]).map(p => p.emp_id));
 
     for (const [brokenEmpId, info] of Object.entries(brokenMap)) {
       const sal = info.salary;
       const candidates = (empBySal[sal] || []).filter(e => !matchedEmpIds.has(e.id));
 
-      if (candidates.length !== 1) continue; // Ambiguous or no match — skip
+      if (candidates.length !== 1) continue;
 
       const emp  = candidates[0];
       const unit = (st.units || []).find(u => u.id === emp.unit_id);
       matchedEmpIds.add(emp.id);
 
-      // Patch all payroll records for this broken emp_id
       info.recs.forEach(p => {
-        p.emp_id    = emp.id;        // Fix the link
+        p.emp_id    = emp.id;
         p.emp_name  = emp.name || '';
         p.emp_code  = emp.emp_code || '';
         p.emp_type  = emp.type || '';
@@ -134,7 +140,6 @@ const SSIPayroll = (() => {
   }
 
   function refresh(area) {
-    // Auto-repair broken employee links (silent, saves only if needed)
     _repairPayrollLinks().then(() => {
       _doRefresh(area);
     });
@@ -144,11 +149,9 @@ const SSIPayroll = (() => {
     const st    = SSIApp.getState();
     const today = new Date().toISOString().slice(0,7);
     const isAdmin = SSIApp.hasRole('ADMIN');
-    const isAccountsOnly = SSIApp.hasRole('ACCOUNTS');  // ACCOUNTS: payroll workers only
+    const isAccountsOnly = SSIApp.hasRole('ACCOUNTS');
 
-    // Payroll records grouped by period
     const payrolls = st.payroll || [];
-    // Unique periods
     const periods = [...new Set(payrolls.map(p=>p.period))].sort().reverse();
 
     area.innerHTML = `
@@ -239,7 +242,6 @@ const SSIPayroll = (() => {
     const statusF  = document.getElementById('pr-filter-status')?.value  || '';
 
     let list = (st.payroll||[]).filter(p => {
-      // ACCOUNTANT and ACCOUNTS see workers only
       const emp = _findEmp(st, p);
       const empType = emp?.type || p.emp_type || '';
       if (!isAdmin && empType === 'STAFF') return false;
@@ -257,11 +259,11 @@ const SSIPayroll = (() => {
       return ((ea?.name||a.emp_name||'')).localeCompare((eb?.name||b.emp_name||''));
     });
 
-    // Summary
-    const totalNet    = list.reduce((s,p)=>s+p.net_pay,0);
-    const totalGross  = list.reduce((s,p)=>s+p.gross_pay,0);
-    const totalOT     = list.reduce((s,p)=>s+p.ot_amount,0);
-    const totalDeduct = list.reduce((s,p)=>s+p.deductions,0);
+    // Summary totals — round each accumulation to avoid drift
+    const totalNet    = _r2(list.reduce((s,p)=>s+_r2(p.net_pay),0));
+    const totalGross  = _r2(list.reduce((s,p)=>s+_r2(p.gross_pay),0));
+    const totalOT     = _r2(list.reduce((s,p)=>s+_r2(p.ot_amount),0));
+    const totalDeduct = _r2(list.reduce((s,p)=>s+_r2(p.deductions),0));
     const paidCount   = list.filter(p=>p.status==='PAID').length;
 
     const summaryEl = document.getElementById('pr-summary');
@@ -277,7 +279,7 @@ const SSIPayroll = (() => {
 
     const tbody = document.getElementById('pr-tbody');
     if (!tbody) return;
-    // Show warning if any visible records have no employee name (orphaned)
+
     const orphaned = list.filter(p => !_findEmp(st, p) && !p.emp_name);
     const orphanBanner = document.getElementById('pr-orphan-banner');
     if (orphanBanner) {
@@ -295,25 +297,32 @@ const SSIPayroll = (() => {
       const emp  = _findEmp(st, p);
       const { name: dName, code: dCode, type: dType, unit: dUnit } = _empDisplay(emp, p);
       const st_badge = _statusBadge(p.status);
+      // Round each value at display time as last-line-of-defense
+      const otHrs   = _r2(p.ot_hours);
+      const otAmt   = _r2(p.ot_amount);
+      const deduct  = _r2(p.deductions);
+      const gross   = _r2(p.gross_pay);
+      const netPay  = _r2(p.net_pay);
+      const monthly = _r2(p.monthly_salary);
       return `<tr>
         <td style="white-space:nowrap;">${_fmtPeriod(p.period)}</td>
         <td><b>${dName}</b><br><span style="font-size:11px;color:#64748b;">${dCode}</span></td>
         <td><span style="background:${dType==='STAFF'?'#FDECEA':'#dcfce7'};color:${dType==='STAFF'?'#922B21':'#166534'};padding:2px 7px;border-radius:10px;font-size:11px;">${dType}</span></td>
         <td>${dUnit}</td>
-        <td style="text-align:right;">₹${_fmt(p.monthly_salary)}</td>
+        <td style="text-align:right;">₹${_fmt(monthly)}</td>
         <td style="text-align:center;">${p.present_days}</td>
         <td style="text-align:center;">${p.half_days}</td>
         <td style="text-align:center;">${p.leave_days}</td>
         <td style="text-align:center;color:#3730a3;font-weight:600;">${p.paid_leaves}</td>
-        <td style="text-align:right;">${p.ot_hours}</td>
-        <td style="text-align:right;color:#f59e0b;font-weight:600;">${p.ot_amount>0?'₹'+_fmt(p.ot_amount):'—'}</td>
-        <td style="text-align:right;color:#991b1b;">${p.deductions>0?'₹'+_fmt(p.deductions):'—'}</td>
-        <td style="text-align:right;font-weight:600;">₹${_fmt(p.gross_pay)}</td>
-        <td style="text-align:right;font-weight:800;font-size:15px;color:#166534;">₹${_fmt(p.net_pay)}</td>
+        <td style="text-align:right;">${_fmt(otHrs)}</td>
+        <td style="text-align:right;color:#f59e0b;font-weight:600;">${otAmt>0?'₹'+_fmt(otAmt):'—'}</td>
+        <td style="text-align:right;color:#991b1b;">${deduct>0?'₹'+_fmt(deduct):'—'}</td>
+        <td style="text-align:right;font-weight:600;">₹${_fmt(gross)}</td>
+        <td style="text-align:right;font-weight:800;font-size:15px;color:#166534;">₹${_fmt(netPay)}</td>
         <td>${st_badge}</td>
         <td style="white-space:nowrap;">
           ${p.status!=='PAID' ? `<button class="btn btn-secondary btn-sm" onclick="SSIPayroll.openEdit('${p.id}')" title="Edit deductions/remarks">✏️</button>` : ''}
-                    ${(p.status!=='PAID'&&SSIApp.hasRole('ADMIN')) ? `<button class="btn btn-danger btn-sm" onclick="SSIPayroll.deletePayroll('${p.id}')" title="Delete record">🗑️</button>` : ''}
+          ${(p.status!=='PAID'&&SSIApp.hasRole('ADMIN')) ? `<button class="btn btn-danger btn-sm" onclick="SSIPayroll.deletePayroll('${p.id}')" title="Delete record">🗑️</button>` : ''}
           ${p.status!=='PAID' ? `<button class="btn btn-primary btn-sm" onclick="SSIPayroll.markPaid('${p.id}')" title="Mark as Paid" style="font-size:11px;">✅ Paid</button>` : ''}
           <button class="btn btn-secondary btn-sm" onclick="SSIPayroll.printSlip('${p.id}')" title="Print Slip">🖨️</button>
         </td>
@@ -373,16 +382,15 @@ const SSIPayroll = (() => {
     const month   = document.getElementById('gen-month')?.value;
     const typeF   = document.getElementById('gen-type')?.value  || '';
     const unitF   = document.getElementById('gen-unit')?.value  || '';
-    // OT rate is auto-calculated per employee (monthly / daysInMonth / 8)
     if (!month) { SSIApp.toast('Select month'); return; }
 
     const st      = SSIApp.getState();
     const isAdmin = SSIApp.hasRole('ADMIN');
-    const isAccountsOnly = SSIApp.hasRole('ACCOUNTS');  // ACCOUNTS: workers only
+    const isAccountsOnly = SSIApp.hasRole('ACCOUNTS');
     if (!st.payroll) st.payroll = [];
 
     let emps = (st.employees||[]).filter(e=>e.active!==false);
-    if (!isAdmin) emps = emps.filter(e=>e.type==='WORKER');  // Accountant/Accounts: workers only
+    if (!isAdmin) emps = emps.filter(e=>e.type==='WORKER');
     if (typeF)    emps = emps.filter(e=>e.type===typeF);
     if (unitF)    emps = emps.filter(e=>e.unit_id===unitF);
 
@@ -395,7 +403,6 @@ const SSIPayroll = (() => {
       return `${yr}-${String(mo).padStart(2,'0')}-${d}`;
     });
 
-    // Build attendance lookup for this month
     const attRecs = (st.attendance||[]).filter(a=>a.date&&a.date.startsWith(month));
     const attMap  = {};
     attRecs.forEach(a => { attMap[`${a.emp_id}|${a.date}`] = a; });
@@ -403,7 +410,6 @@ const SSIPayroll = (() => {
     let generated = 0, skipped = 0;
 
     emps.forEach(emp => {
-      // Check if PAID already → skip
       const existPaid = st.payroll.find(p=>p.emp_id===emp.id&&p.period===month&&p.status==='PAID');
       if (existPaid) { skipped++; return; }
 
@@ -417,26 +423,25 @@ const SSIPayroll = (() => {
         else if (s==='L')      leaves++;
         else if (s==='WO'||s==='HD') woff++;
       });
+      // Round OT hours to 2 decimals to prevent floating-point artifacts
+      otHours = _r2(otHours);
 
-      // Paid leaves for STAFF (max 2)
       const paidLeaves = emp.type==='STAFF' ? Math.min(leaves, PAID_LEAVES_STAFF) : 0;
 
-      // Effective working days for salary calc
-      const effectiveDays = present + (half * 0.5) + paidLeaves;
-      const perDay        = Math.round(((emp.monthly_salary||0) / daysInMonth) * 100) / 100;
-      const otRate        = Math.round(((emp.monthly_salary||0) / daysInMonth / 8) * 100) / 100;
-      const grossBase     = Math.round(perDay * effectiveDays * 100) / 100;
-      const otAmount      = emp.type==='WORKER' ? Math.round(otHours * otRate * 100) / 100 : 0;
-      const grossPay      = Math.round((grossBase + otAmount) * 100) / 100;
+      const effectiveDays = _r2(present + (half * 0.5) + paidLeaves);
+      const perDay        = _r2((emp.monthly_salary||0) / daysInMonth);
+      const otRate        = _r2((emp.monthly_salary||0) / daysInMonth / 8);
+      const grossBase     = _r2(perDay * effectiveDays);
+      const otAmount      = emp.type==='WORKER' ? _r2(otHours * otRate) : 0;
+      const grossPay      = _r2(grossBase + otAmount);
 
-      // Existing deductions — keep if re-generating non-paid
       const existing      = st.payroll.find(p=>p.emp_id===emp.id&&p.period===month);
-      const advance       = existing?.advance || 0;
-      const epfAmount     = Math.round(grossBase * EPF_RATE * 100) / 100;
-      const esiAmount     = grossPay <= ESI_LIMIT ? Math.round(grossPay * ESI_RATE * 100) / 100 : 0;
-      const totalDeduct   = Math.round((advance + epfAmount + esiAmount) * 100) / 100;
-      const deductions    = totalDeduct;  // for backward compat field
-      const netPay        = Math.max(0, Math.round((grossPay - totalDeduct) * 100) / 100);
+      const advance       = _r2(existing?.advance || 0);
+      const epfAmount     = _r2(grossBase * EPF_RATE);
+      const esiAmount     = grossPay <= ESI_LIMIT ? _r2(grossPay * ESI_RATE) : 0;
+      const totalDeduct   = _r2(advance + epfAmount + esiAmount);
+      const deductions    = totalDeduct;
+      const netPay        = Math.max(0, _r2(grossPay - totalDeduct));
 
       const rec = {
         id:             existing?.id || SSIApp.uid(),
@@ -446,7 +451,7 @@ const SSIPayroll = (() => {
         emp_type:       emp.type||'',
         unit_name:      (SSIApp.getState().units||[]).find(u=>u.id===emp.unit_id)?.name||'',
         period:         month,
-        monthly_salary: emp.monthly_salary||0,
+        monthly_salary: _r2(emp.monthly_salary||0),
         working_days:   daysInMonth,
         present_days:   present,
         half_days:      half,
@@ -483,7 +488,6 @@ const SSIPayroll = (() => {
     SSIApp.audit('PAYROLL_GENERATE', `Generated ${generated} records for ${month}`);
     SSIApp.closeModal();
 
-    // Set filter to the generated month
     const sel = document.getElementById('pr-filter-period');
     if (sel) {
       const opt = [...sel.options].find(o=>o.value===month);
@@ -511,15 +515,15 @@ const SSIPayroll = (() => {
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
         <div>
           <label>💰 Advance / Loan Recovery (₹)</label>
-          <input type="number" id="edit-advance" value="${rec.advance||0}" min="0" oninput="SSIPayroll._calcNet()">
+          <input type="number" id="edit-advance" value="${_r2(rec.advance||0)}" min="0" step="0.01" oninput="SSIPayroll._calcNet()">
         </div>
         <div>
           <label>📌 EPF (12% of Basic) <span style="font-size:10px;color:#64748b;">auto</span></label>
-          <input type="number" id="edit-epf" value="${rec.epf_amount||0}" min="0" step="0.01" oninput="SSIPayroll._calcNet()">
+          <input type="number" id="edit-epf" value="${_r2(rec.epf_amount||0)}" min="0" step="0.01" oninput="SSIPayroll._calcNet()">
         </div>
         <div>
           <label>🏥 ESI (0.75% if ≤₹21K) <span style="font-size:10px;color:#64748b;">auto</span></label>
-          <input type="number" id="edit-esi" value="${rec.esi_amount||0}" min="0" step="0.01" oninput="SSIPayroll._calcNet()">
+          <input type="number" id="edit-esi" value="${_r2(rec.esi_amount||0)}" min="0" step="0.01" oninput="SSIPayroll._calcNet()">
         </div>
         <div>
           <label>📝 Deduction Note</label>
@@ -541,7 +545,7 @@ const SSIPayroll = (() => {
       </div>
       <div style="background:#FDECEA;border-radius:8px;padding:12px;margin-top:14px;text-align:center;">
         <span style="font-size:13px;">Revised Net Pay: </span>
-        <span id="edit-net-preview" data-gross="${rec.gross_pay}" style="font-size:20px;font-weight:800;color:#922B21;">₹${_fmt(rec.net_pay||rec.gross_pay)}</span>
+        <span id="edit-net-preview" data-gross="${_r2(rec.gross_pay)}" style="font-size:20px;font-weight:800;color:#922B21;">₹${_fmt(rec.net_pay||rec.gross_pay)}</span>
       </div>
       <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;">
         <button class="btn btn-secondary" onclick="SSIApp.closeModal()">Cancel</button>
@@ -550,13 +554,13 @@ const SSIPayroll = (() => {
   }
 
   function _calcNet() {
-    const adv = parseFloat(document.getElementById('edit-advance')?.value)||0;
-    const epf = parseFloat(document.getElementById('edit-epf')?.value)||0;
-    const esi = parseFloat(document.getElementById('edit-esi')?.value)||0;
-    const gross = parseFloat(document.getElementById('edit-net-preview')?.dataset?.gross || 0);
-    const n = Math.max(0, gross - adv - epf - esi);
+    const adv = _r2(parseFloat(document.getElementById('edit-advance')?.value)||0);
+    const epf = _r2(parseFloat(document.getElementById('edit-epf')?.value)||0);
+    const esi = _r2(parseFloat(document.getElementById('edit-esi')?.value)||0);
+    const gross = _r2(parseFloat(document.getElementById('edit-net-preview')?.dataset?.gross || 0));
+    const n = Math.max(0, _r2(gross - adv - epf - esi));
     const el = document.getElementById('edit-net-preview');
-    if (el) { el.textContent = '₹' + n.toLocaleString('en-IN',{maximumFractionDigits:2}); }
+    if (el) { el.textContent = '₹' + _fmt(n); }
   }
 
   async function saveEdit(recId) {
@@ -564,11 +568,11 @@ const SSIPayroll = (() => {
     const idx = (st.payroll||[]).findIndex(p=>p.id===recId);
     if (idx<0) return;
     const rec     = st.payroll[idx];
-    const advance = Math.max(0, parseFloat(document.getElementById('edit-advance')?.value)||0);
-    const epf     = Math.max(0, parseFloat(document.getElementById('edit-epf')?.value)||0);
-    const esi     = Math.max(0, parseFloat(document.getElementById('edit-esi')?.value)||0);
-    const totalD  = Math.round((advance + epf + esi)*100)/100;
-    const netPay  = Math.max(0, Math.round((rec.gross_pay - totalD)*100)/100);
+    const advance = Math.max(0, _r2(parseFloat(document.getElementById('edit-advance')?.value)||0));
+    const epf     = Math.max(0, _r2(parseFloat(document.getElementById('edit-epf')?.value)||0));
+    const esi     = Math.max(0, _r2(parseFloat(document.getElementById('edit-esi')?.value)||0));
+    const totalD  = _r2(advance + epf + esi);
+    const netPay  = Math.max(0, _r2(rec.gross_pay - totalD));
 
     st.payroll[idx] = {
       ...rec,
@@ -610,7 +614,8 @@ const SSIPayroll = (() => {
     if (!rec) return;
     const emp  = _findEmp(st, rec);
     const { name: _n, code: _c, type: _t, unit: _u } = _empDisplay(emp, rec);
-    const perDay = ((rec.monthly_salary||0)/(rec.working_days||30)).toFixed(2);
+    const unit = (st.units||[]).find(u => u.id === emp?.unit_id);
+    const perDay = _r2((rec.monthly_salary||0)/(rec.working_days||30));
 
     const slip = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Salary Slip</title>
     <style>
@@ -626,7 +631,7 @@ const SSIPayroll = (() => {
       @media print{body{margin:0;}}
     </style></head><body>
     <h2>SSI Group — Salary Slip</h2>
-    <div class="sub">Unit: ${unit?.name||'—'} &nbsp;|&nbsp; Month: <b>${_fmtPeriod(rec.period)}</b></div>
+    <div class="sub">Unit: ${_u||'—'} &nbsp;|&nbsp; Month: <b>${_fmtPeriod(rec.period)}</b></div>
     <table>
       <tr><td class="row-label">Employee Name</td><td>${_n}</td><td class="row-label">Employee Code</td><td>${_c}</td></tr>
       <tr><td class="row-label">Designation</td><td>${emp?.designation||'—'}</td><td class="row-label">Department</td><td>${emp?.department||'—'}</td></tr>
@@ -635,10 +640,10 @@ const SSIPayroll = (() => {
     <table>
       <tr><th colspan="2">📅 Attendance</th><th colspan="2">💰 Earnings</th></tr>
       <tr><td class="row-label">Working Days (Month)</td><td>${rec.working_days}</td><td class="row-label">Monthly Salary</td><td>₹${_fmt(rec.monthly_salary)}</td></tr>
-      <tr><td class="row-label">Present Days</td><td>${rec.present_days}</td><td class="row-label">Per Day Rate</td><td>₹${perDay}</td></tr>
-      <tr><td class="row-label">Half Days</td><td>${rec.half_days}</td><td class="row-label">Basic Earnings</td><td>₹${_fmt(rec.gross_pay - rec.ot_amount)}</td></tr>
-      <tr><td class="row-label">Leaves Taken</td><td>${rec.leave_days}</td><td class="row-label">OT Hours</td><td>${rec.ot_hours} hrs</td></tr>
-      <tr><td class="row-label">Paid Leaves</td><td>${rec.paid_leaves}</td><td class="row-label">OT Amount (₹${(rec.ot_rate||0).toFixed(2)}/hr)</td><td>₹${_fmt(rec.ot_amount)}</td></tr>
+      <tr><td class="row-label">Present Days</td><td>${rec.present_days}</td><td class="row-label">Per Day Rate</td><td>₹${_fmt(perDay)}</td></tr>
+      <tr><td class="row-label">Half Days</td><td>${rec.half_days}</td><td class="row-label">Basic Earnings</td><td>₹${_fmt(_r2(rec.gross_pay - rec.ot_amount))}</td></tr>
+      <tr><td class="row-label">Leaves Taken</td><td>${rec.leave_days}</td><td class="row-label">OT Hours</td><td>${_fmt(rec.ot_hours)} hrs</td></tr>
+      <tr><td class="row-label">Paid Leaves</td><td>${rec.paid_leaves}</td><td class="row-label">OT Amount (₹${_fmt(rec.ot_rate||0)}/hr)</td><td>₹${_fmt(rec.ot_amount)}</td></tr>
       <tr><td class="row-label">Absent Days</td><td>${rec.absent_days}</td><td class="row-label">Gross Pay</td><td><b>₹${_fmt(rec.gross_pay)}</b></td></tr>
     </table>
     <table>
@@ -700,8 +705,8 @@ const SSIPayroll = (() => {
       const unit = (st.units||[]).find(u=>u.id===emp?.unit_id);
       rows.push([
         p.period, emp?.emp_code||p.emp_code||'', emp?.name||p.emp_name||'', emp?.type||p.emp_type||'', unit?.name||p.unit_name||'',
-        p.monthly_salary, p.present_days, p.half_days, p.leave_days, p.paid_leaves,
-        p.ot_hours, p.ot_amount, p.deductions, p.gross_pay, p.net_pay,
+        _r2(p.monthly_salary), p.present_days, p.half_days, p.leave_days, p.paid_leaves,
+        _r2(p.ot_hours), _r2(p.ot_amount), _r2(p.deductions), _r2(p.gross_pay), _r2(p.net_pay),
         p.status, p.payment_mode||'', p.payment_date||'', p.remarks||''
       ]);
     });
@@ -710,7 +715,9 @@ const SSIPayroll = (() => {
 
   /* ── Helpers ─────────────────────────────────────────────── */
   function _fmt(n) {
-    return (n||0).toLocaleString('en-IN', {minimumFractionDigits:0, maximumFractionDigits:2});
+    // Round to 2 decimals first, then format with Indian thousand separators
+    const rounded = _r2(n);
+    return rounded.toLocaleString('en-IN', {minimumFractionDigits:0, maximumFractionDigits:2});
   }
   function _fmtPeriod(ym) {
     if (!ym) return '';
@@ -729,19 +736,15 @@ const SSIPayroll = (() => {
   }
 
 
-  /* ── Re-link Orphaned Payroll Records ───────────────────────
-     When employees are deleted+reimported, payroll emp_ids break.
-     This modal lets admin manually map each orphaned emp_id to
-     the correct current employee.                              */
+  /* ── Re-link Orphaned Payroll Records ────────────────────── */
   function openRelinkModal() {
     if (!SSIApp.hasRole('ADMIN')) return;
     const st   = SSIApp.getState();
     const emps = (st.employees||[]).filter(e=>e.active!==false);
 
-    // Find unique orphaned emp_ids (not found by any lookup tier)
     const orphanGroups = {};
     (st.payroll||[]).forEach(p => {
-      if (_findEmp(st, p)) return; // already linked — skip
+      if (_findEmp(st, p)) return;
       if (!orphanGroups[p.emp_id]) {
         orphanGroups[p.emp_id] = { salary: p.monthly_salary, count: 0, ids: [] };
       }
@@ -761,7 +764,7 @@ const SSIPayroll = (() => {
 
     const rows = orphanList.map(([oldId, info], i) => `
       <tr style="border-bottom:1px solid #e2e8f0;">
-        <td style="padding:10px 8px;font-size:12px;color:#64748b;">${info.count} record(s)<br>Salary: ₹${(info.salary||0).toLocaleString('en-IN')}</td>
+        <td style="padding:10px 8px;font-size:12px;color:#64748b;">${info.count} record(s)<br>Salary: ₹${_fmt(info.salary||0)}</td>
         <td style="padding:10px 8px;">
           <select id="relink-sel-${i}" data-oldid="${oldId}" data-recids="${info.ids.join(',')}"
             style="width:100%;padding:6px 10px;border:1.5px solid #e2e8f0;border-radius:8px;font-size:13px;">
@@ -801,7 +804,6 @@ const SSIPayroll = (() => {
     const emps = st.employees || [];
     let linked = 0;
 
-    // Collect all select elements with data-oldid
     document.querySelectorAll('[data-oldid]').forEach(sel => {
       const newEmpId = sel.value;
       if (!newEmpId) return;
