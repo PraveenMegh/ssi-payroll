@@ -17,6 +17,8 @@
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 
+  
+
   <style>
     /* ── Reset ── */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -440,7 +442,167 @@
     @media (max-width: 480px) {
       #login-card { padding: 2.5rem 1.5rem 4rem; }
       #login-geo-back { display: none; }
+    }   
+
+    /* ============================================================
+       STICKY TABLE HEADERS + FROZEN FIRST COLUMNS
+       Added: 2026-05-09
+       - Brand-consistent dark red headers on all tables
+       - Top header row stays visible when scrolling vertically
+       - On Attendance/Employees/Payroll, left identity columns
+         stay visible when scrolling horizontally
+       - Fixes invisible header rows on Clients & Users
+       ============================================================ */
+
+    /* 1. Make all tables have sticky brand-colored top headers */
+    .card { position: relative; }
+
+    table {
+      border-collapse: separate !important;
+      border-spacing: 0;
     }
+
+    table thead th {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      background: #8B1A1A !important;       /* brand dark red */
+      color: #ffffff !important;
+      font-weight: 700;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+      padding: 10px 12px !important;
+      border-bottom: 2px solid #5a0f0f !important;
+      white-space: nowrap;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.08);
+    }
+
+    /* Fix specifically for Clients/Vendors and Users where header
+       was rendering with light/white text and no background */
+    .card table thead tr {
+      background: #8B1A1A !important;
+    }
+    .card table thead th,
+    .card table thead th * {
+      color: #ffffff !important;
+    }
+
+    /* Center-aligned headers should keep their alignment */
+    table thead th[style*="text-align:center"]  { text-align: center !important; }
+    table thead th[style*="text-align:right"]   { text-align: right  !important; }
+    table thead th[style*="text-align:left"]    { text-align: left   !important; }
+
+    /* 2. Scroll-area heights so sticky has something to stick INSIDE */
+    .card[style*="overflow-x:auto"],
+    .card[style*="overflow-x: auto"] {
+      max-height: calc(100vh - 280px);   /* leaves room for top bar + filters */
+      overflow-y: auto;
+    }
+
+    /* 3. ATTENDANCE — freeze the leftmost employee identity column */
+    #attendance-table thead th:first-child,
+    #attendance-table tbody td:first-child {
+      position: sticky;
+      left: 0;
+      z-index: 4;
+      background: #ffffff;
+      border-right: 2px solid #8B1A1A;
+      min-width: 180px;
+    }
+    #attendance-table thead th:first-child {
+      z-index: 6;                         /* sits above other headers at corner */
+      background: #8B1A1A !important;
+      color: #ffffff !important;
+    }
+    #attendance-table tbody tr:nth-child(even) td:first-child {
+      background: #fdf6f6;                /* match zebra stripe */
+    }
+
+    /* 4. EMPLOYEES — freeze CODE + NAME columns (cols 2 & 3 because col 1 is checkbox) */
+    #emp-table thead th:nth-child(1),
+    #emp-table tbody td:nth-child(1),
+    #emp-table thead th:nth-child(2),
+    #emp-table tbody td:nth-child(2),
+    #emp-table thead th:nth-child(3),
+    #emp-table tbody td:nth-child(3) {
+      position: sticky;
+      z-index: 4;
+      background: #ffffff;
+    }
+    #emp-table thead th:nth-child(1),
+    #emp-table thead th:nth-child(2),
+    #emp-table thead th:nth-child(3) {
+      z-index: 6;
+      background: #8B1A1A !important;
+      color: #ffffff !important;
+    }
+    #emp-table thead th:nth-child(1),
+    #emp-table tbody td:nth-child(1) { left: 0;     min-width: 40px; }
+    #emp-table thead th:nth-child(2),
+    #emp-table tbody td:nth-child(2) { left: 40px;  min-width: 80px; }
+    #emp-table thead th:nth-child(3),
+    #emp-table tbody td:nth-child(3) {
+      left: 120px;
+      min-width: 180px;
+      border-right: 2px solid #8B1A1A;
+    }
+    #emp-table tbody tr:nth-child(even) td:nth-child(1),
+    #emp-table tbody tr:nth-child(even) td:nth-child(2),
+    #emp-table tbody tr:nth-child(even) td:nth-child(3) {
+      background: #fdf6f6;
+    }
+
+    /* 5. PAYROLL — freeze PERIOD + EMPLOYEE columns (cols 1 & 2) */
+    #pr-table thead th:nth-child(1),
+    #pr-table tbody td:nth-child(1),
+    #pr-table thead th:nth-child(2),
+    #pr-table tbody td:nth-child(2) {
+      position: sticky;
+      z-index: 4;
+      background: #ffffff;
+    }
+    #pr-table thead th:nth-child(1),
+    #pr-table thead th:nth-child(2) {
+      z-index: 6;
+      background: #8B1A1A !important;
+      color: #ffffff !important;
+    }
+    #pr-table thead th:nth-child(1),
+    #pr-table tbody td:nth-child(1) { left: 0;    min-width: 100px; }
+    #pr-table thead th:nth-child(2),
+    #pr-table tbody td:nth-child(2) {
+      left: 100px;
+      min-width: 180px;
+      border-right: 2px solid #8B1A1A;
+    }
+    #pr-table tbody tr:nth-child(even) td:nth-child(1),
+    #pr-table tbody tr:nth-child(even) td:nth-child(2) {
+      background: #fdf6f6;
+    }
+
+    /* 6. Smooth scrolling and zebra rows for readability */
+    table tbody tr:nth-child(even) td { background: #fdf6f6; }
+    table tbody tr:hover td           { background: #fef1f1 !important; }
+
+    /* 7. Mobile fallback — disable column freeze on small screens */
+    @media (max-width: 768px) {
+      #attendance-table thead th:first-child,
+      #attendance-table tbody td:first-child,
+      #emp-table thead th:nth-child(1),
+      #emp-table tbody td:nth-child(1),
+      #emp-table thead th:nth-child(2),
+      #emp-table tbody td:nth-child(2),
+      #emp-table thead th:nth-child(3),
+      #emp-table tbody td:nth-child(3),
+      #pr-table thead th:nth-child(1),
+      #pr-table tbody td:nth-child(1),
+      #pr-table thead th:nth-child(2),
+      #pr-table tbody td:nth-child(2) {
+        position: static;
+      }
+    }
+   
   </style>
 </head>
 <body>
