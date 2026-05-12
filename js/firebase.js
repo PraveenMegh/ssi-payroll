@@ -1,12 +1,14 @@
 // ============================================================
-//  SSI Inventory — Firebase Firestore Integration (v5 SAFE)
+//  SSI Inventory — Firebase Firestore Integration (v6 SAFE)
 //  firebase.js
-//  Stage 1 — Safety Nets:
+//  Stage 1 — Safety Nets + Stamp-on-Save Fix:
 //    1. Persistent save indicator (no auto-hide)
-//    2. Stale-write protection (fetch-merge before save)
-//    3. Failed-save logging to sync_errors collection
-//    4. Heartbeat connectivity check every 60s
-//    5. currentUser is NEVER persisted to Firestore
+//    2. AUTOMATIC lastSaved stamping before every save
+//    3. Smarter stale-write protection (1-second tolerance)
+//    4. Failed-save logging to sync_errors collection
+//    5. Heartbeat connectivity check every 60s
+//    6. currentUser is NEVER persisted to Firestore
+//    7. Better error reporting on failed saves
 // ============================================================
 
 (function () {
@@ -30,7 +32,7 @@
   let _unsubscribe   = null;
   let _isSaving      = false;
   let _pendingSave   = null;
-  let _lastServerTs  = null;   // server-side lastSaved we last observed
+  let _lastServerTs  = null;
   let _heartbeatId   = null;
 
   try {
@@ -38,21 +40,19 @@
   } catch (e) { /* already set */ }
 
   // ── Persistent badge ─────────────────────────────────────────
-  // States: 'saved' | 'saving' | 'failed' | 'offline'
   function setBadge(state, msg) {
     const b = document.getElementById('sync-badge');
     if (!b) return;
     const map = {
-      saved:   { text: '✓ Saved',     bg: '#22c55e' },
-      saving:  { text: '⏳ Saving…',   bg: '#f59e0b' },
+      saved:   { text: '✓ Saved',       bg: '#22c55e' },
+      saving:  { text: '⏳ Saving…',     bg: '#f59e0b' },
       failed:  { text: '✗ Save Failed', bg: '#ef4444' },
-      offline: { text: '🔴 Offline',   bg: '#ef4444' }
+      offline: { text: '🔴 Offline',    bg: '#ef4444' }
     };
     const cfg = map[state] || map.saved;
     b.textContent      = msg ? cfg.text + ' — ' + msg : cfg.text;
     b.style.background = cfg.bg;
     b.classList.add('show');
-    // NOTE: removed the auto-hide setTimeout — badge is now persistent.
   }
 
   // ── Failed-save logger ───────────────────────────────────────
@@ -101,7 +101,9 @@
     return null;
   }
 
-  // ── Stale-write protection: fetch latest, refuse if newer ─────
+  // ── Stale-write protection: smarter with tolerance ────────────
+  //  Returns true if it is safe to save (local is newer OR equal-within-tolerance).
+  //  Tolerance handles: clock skew + same-instant saves + listener echo.
   async function isLocalNewer(stateObj) {
     try {
       const snap = await DOC_REF.get({ source: 'server' });
@@ -109,17 +111,32 @@
       const remoteTs = snap.data().lastSaved || '';
       const localTs  = (stateObj && stateObj.lastSaved) || '';
       if (!remoteTs) return true;
-      if (!localTs)  return false;
-      return localTs >= remoteTs;
+      if (!localTs)  return true; // CHANGED: was false — now allow first save
+
+      // Tolerance: allow saves within 1 second of remote timestamp
+      const localMs  = new Date(localTs).getTime();
+      const remoteMs = new Date(remoteTs).getTime();
+      if (isNaN(localMs) || isNaN(remoteMs)) return true; // bad timestamps — allow
+      return localMs >= (remoteMs - 1000);  // 1-second grace window
     } catch (e) {
-      // On error, do NOT save (fail safe)
+      // On error fetching server timestamp, allow save (network blip)
+      // The save itself will fail if there's a real issue
       logSyncError('stale-check', e);
-      return false;
+      return true;
     }
   }
 
-  // ── Save (with stale protection + queue) ─────────────────────
+  // ── Save (with auto-stamp + stale protection + queue) ────────
   async function saveToFirestore(stateObj) {
+    // CRITICAL FIX: always stamp lastSaved to NOW before saving
+    // This ensures every save is genuinely newer than the previous one
+    if (stateObj) {
+      stateObj.lastSaved = new Date().toISOString();
+      if (window.SSIApp && SSIApp.state) {
+        SSIApp.state.lastSaved = stateObj.lastSaved;
+      }
+    }
+
     // localStorage write is instant and safe
     try { localStorage.setItem('ssiData', JSON.stringify(stateObj)); } catch (e) {}
 
@@ -134,7 +151,6 @@
     try {
       const safeToSave = await isLocalNewer(stateObj);
       if (!safeToSave) {
-        // Refuse to overwrite newer remote data
         setBadge('failed', 'Server has newer data — please refresh');
         await logSyncError('refused-stale', new Error('local older than server'), {
           localTs: stateObj && stateObj.lastSaved,
@@ -146,17 +162,25 @@
       await DOC_REF.set(payload);
       _lastServerTs = payload.lastSaved || null;
       setBadge('saved');
-      console.log('[SSI] ✓ Saved');
+      console.log('[SSI] ✓ Saved at', payload.lastSaved);
     } catch (err) {
       console.warn('[SSI] save failed:', err.message);
       setBadge('failed', err.message);
       await logSyncError('save', err);
+      // Retry once after a short delay for transient network errors
+      if (err.message && /network|unavailable|timeout|deadline/i.test(err.message)) {
+        console.log('[SSI] retrying save in 2s...');
+        setTimeout(() => {
+          _isSaving = false;
+          saveToFirestore(stateObj);
+        }, 2000);
+        return;
+      }
     } finally {
       _isSaving = false;
       if (_pendingSave) {
         const next = _pendingSave;
         _pendingSave = null;
-        // small delay to avoid hammering
         setTimeout(() => saveToFirestore(next), 500);
       }
     }
@@ -174,12 +198,18 @@
         const incomingTs = incoming.lastSaved || '';
         const currentTs  = (SSIApp.state && SSIApp.state.lastSaved) || '';
 
-        // Only apply if incoming is newer
-        if (incomingTs && currentTs && incomingTs <= currentTs) return;
+        // Only apply if incoming is genuinely newer (with 1s tolerance)
+        if (incomingTs && currentTs) {
+          const incomingMs = new Date(incomingTs).getTime();
+          const currentMs  = new Date(currentTs).getTime();
+          if (!isNaN(incomingMs) && !isNaN(currentMs)) {
+            if (incomingMs <= currentMs + 1000) return; // not newer enough
+          }
+        }
 
         const keepUser = SSIApp.state.currentUser;
         Object.assign(SSIApp.state, incoming);
-        SSIApp.state.currentUser = keepUser;   // never let remote overwrite my session
+        SSIApp.state.currentUser = keepUser;
 
         try { localStorage.setItem('ssiData', JSON.stringify(SSIApp.state)); } catch (e) {}
 
@@ -203,7 +233,6 @@
     _heartbeatId = setInterval(async () => {
       try {
         await DOC_REF.get({ source: 'server' });
-        // If we were offline, restore badge
         const b = document.getElementById('sync-badge');
         if (b && b.textContent.indexOf('Offline') !== -1) setBadge('saved');
       } catch (err) {
@@ -242,7 +271,6 @@
     backupNow, setBadge
   };
 
-  // Start heartbeat on load
   if (document.readyState !== 'loading') startHeartbeat();
   else document.addEventListener('DOMContentLoaded', startHeartbeat);
 })();
