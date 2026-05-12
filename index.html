@@ -753,7 +753,34 @@
 <script src="js/attendance.js"></script>
 <script src="js/payroll.js"></script>
 <script src="js/backup.js"></script>
-
+<!-- 🛡️ SSI Backup — render card and run daily reminder on login -->
+<script>
+ (function () {
+ function tryInitBackup() {
+ if (typeof SSIBackup === 'undefined' || !SSIApp || !SSIApp.state) {
+ return setTimeout(tryInitBackup, 600);
+ }
+ if (!SSIApp.state.currentUser) {
+ return setTimeout(tryInitBackup, 600);
+ }
+ if (typeof SSIApp.hasRole === 'function' && SSIApp.hasRole('ADMIN')) {
+ SSIBackup.renderCard('backup-card');
+ SSIBackup.checkDailyReminder();
+ }
+ }
+ document.addEventListener('DOMContentLoaded', () => setTimeout(tryInitBackup, 1000));
+ // Also re-render when admin navigates between pages
+ document.addEventListener('click', (e) => {
+ if (e.target && (e.target.closest('[onclick*="navigate"]') || e.target.closest('.nav-item'))) {
+ setTimeout(() => {
+ if (typeof SSIBackup !== 'undefined' && SSIApp.hasRole('ADMIN')) {
+ SSIBackup.renderCard('backup-card');
+ }
+ }, 500);
+ }
+ });
+ })();
+</script>
 
 </body>
 </html>
