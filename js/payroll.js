@@ -216,6 +216,7 @@ const SSIPayroll = (() => {
             <th style="text-align:center;">H</th>
             <th style="text-align:center;">L</th>
             <th style="text-align:center;">Paid L</th>
+            <th style="text-align:right;" title="Total hours worked this month (hourly attendance)">⏱ Worked Hrs</th>
             <th style="text-align:right;">OT Hrs</th>
             <th style="text-align:right;">OT Amt</th>
             <th style="text-align:right;">Deduct.</th>
@@ -224,7 +225,7 @@ const SSIPayroll = (() => {
             <th>Status</th>
             <th>Actions</th>
           </tr></thead>
-          <tbody id="pr-tbody"><tr><td colspan="16" style="text-align:center;padding:40px;color:#94a3b8;">Select a month and generate payroll to begin.</td></tr></tbody>
+          <tbody id="pr-tbody"><tr><td colspan="17" style="text-align:center;padding:40px;color:#94a3b8;">Select a month and generate payroll to begin.</td></tr></tbody>
         </table>
         <div id="pr-total-row" style="padding:12px 16px;font-size:13px;color:#64748b;text-align:right;"></div>
       </div>`;
@@ -291,7 +292,7 @@ const SSIPayroll = (() => {
       }
     }
 
-    if (!list.length) { tbody.innerHTML = `<tr><td colspan="16" style="text-align:center;padding:40px;color:#94a3b8;">No payroll records found.</td></tr>`; return; }
+    if (!list.length) { tbody.innerHTML = `<tr><td colspan="17" style="text-align:center;padding:40px;color:#94a3b8;">No payroll records found.</td></tr>`; return; }
 
     tbody.innerHTML = list.map(p => {
       const emp  = _findEmp(st, p);
@@ -304,6 +305,8 @@ const SSIPayroll = (() => {
       const gross   = _r2(p.gross_pay);
       const netPay  = _r2(p.net_pay);
       const monthly = _r2(p.monthly_salary);
+      const workedH = _r2(p.total_worked_hours || 0);
+      const whLabel = workedH > 0 ? `${workedH}h` : '—';
       return `<tr>
         <td style="white-space:nowrap;">${_fmtPeriod(p.period)}</td>
         <td><b>${dName}</b><br><span style="font-size:11px;color:#64748b;">${dCode}</span></td>
@@ -314,6 +317,7 @@ const SSIPayroll = (() => {
         <td style="text-align:center;">${p.half_days}</td>
         <td style="text-align:center;">${p.leave_days}</td>
         <td style="text-align:center;color:#3730a3;font-weight:600;">${p.paid_leaves}</td>
+        <td style="text-align:right;color:#0369a1;font-weight:600;" title="Total hours worked (from hourly attendance)">${whLabel}</td>
         <td style="text-align:right;">${_fmt(otHrs)}</td>
         <td style="text-align:right;color:#f59e0b;font-weight:600;">${otAmt>0?'₹'+_fmt(otAmt):'—'}</td>
         <td style="text-align:right;color:#991b1b;">${deduct>0?'₹'+_fmt(deduct):'—'}</td>
@@ -360,10 +364,12 @@ const SSIPayroll = (() => {
           </select>
         </div>
         <div style="background:#e0f2fe;border-radius:8px;padding:10px;font-size:12px;color:#0369a1;">
-          <b>ℹ️ OT Rate</b><br>Auto = Monthly ÷ days ÷ 8 hrs<br>e.g. ₹15,000 salary in 31-day month = ₹60.48/hr</div>
+          <b>⏱ Hourly Attendance</b><br>OT = worked_hours − 8h/day<br>Auto = Monthly ÷ days ÷ 8 per hour<br>e.g. ₹15,000 / 31 days / 8h = ₹60.48/hr</div>
       </div>
       <div style="background:#fef3c7;border-radius:8px;padding:12px;font-size:13px;margin-bottom:16px;">
-        <b>ℹ️ Rules applied:</b><br>
+        <b>ℹ️ Rules applied (⏱ Hourly Basis):</b><br>
+        • <b>Attendance source:</b> check-in / check-out times from Attendance module<br>
+        • OT auto-computed: worked_hours − 8h = OT (stored per record)<br>
         • Per day salary = Monthly ÷ actual days in selected month (28/29/30/31)<br>
         • OT rate = (Monthly Salary ÷ days ÷ 8) per hour — auto-calculated<br>
         • Staff: up to ${PAID_LEAVES_STAFF} leaves/month counted as Present<br>
@@ -413,18 +419,33 @@ const SSIPayroll = (() => {
       const existPaid = st.payroll.find(p=>p.emp_id===emp.id&&p.period===month&&p.status==='PAID');
       if (existPaid) { skipped++; return; }
 
-      let present=0, half=0, leaves=0, absent=0, woff=0, otHours=0;
+      let present=0, half=0, leaves=0, absent=0, woff=0, otHours=0, totalWorkedHours=0;
       days.forEach(d => {
         const rec = attMap[`${emp.id}|${d}`];
         const s   = rec?.status || 'A';
-        if (s==='P')           { present++; if(rec?.ot_hours) otHours+=Number(rec.ot_hours); }
-        else if (s==='A')      absent++;
-        else if (s==='H')      { half++; if(rec?.ot_hours) otHours+=Number(rec.ot_hours); }
-        else if (s==='L')      leaves++;
-        else if (s==='WO'||s==='HD') woff++;
+        // ── Hourly basis: use worked_hours if available ──
+        const wh  = Number(rec?.worked_hours) || 0;
+        const ot  = Number(rec?.ot_hours)     || 0;
+        if (s==='P') {
+          present++;
+          // Use actual OT from hourly data; fall back to stored ot_hours field
+          otHours += ot || 0;
+          totalWorkedHours += wh;
+        } else if (s==='A') {
+          absent++;
+        } else if (s==='H') {
+          half++;
+          otHours += ot || 0;
+          totalWorkedHours += wh;
+        } else if (s==='L') {
+          leaves++;
+        } else if (s==='WO'||s==='HD') {
+          woff++;
+        }
       });
       // Round OT hours to 2 decimals to prevent floating-point artifacts
-      otHours = _r2(otHours);
+      otHours          = _r2(otHours);
+      totalWorkedHours = _r2(totalWorkedHours);
 
       const paidLeaves = emp.type==='STAFF' ? Math.min(leaves, PAID_LEAVES_STAFF) : 0;
 
@@ -459,6 +480,7 @@ const SSIPayroll = (() => {
         paid_leaves:    paidLeaves,
         absent_days:    absent,
         week_offs:      woff,
+        total_worked_hours: totalWorkedHours,
         ot_hours:       otHours,
         ot_rate:        otRate,
         ot_amount:      otAmount,
@@ -642,9 +664,10 @@ const SSIPayroll = (() => {
       <tr><td class="row-label">Working Days (Month)</td><td>${rec.working_days}</td><td class="row-label">Monthly Salary</td><td>₹${_fmt(rec.monthly_salary)}</td></tr>
       <tr><td class="row-label">Present Days</td><td>${rec.present_days}</td><td class="row-label">Per Day Rate</td><td>₹${_fmt(perDay)}</td></tr>
       <tr><td class="row-label">Half Days</td><td>${rec.half_days}</td><td class="row-label">Basic Earnings</td><td>₹${_fmt(_r2(rec.gross_pay - rec.ot_amount))}</td></tr>
-      <tr><td class="row-label">Leaves Taken</td><td>${rec.leave_days}</td><td class="row-label">OT Hours</td><td>${_fmt(rec.ot_hours)} hrs</td></tr>
-      <tr><td class="row-label">Paid Leaves</td><td>${rec.paid_leaves}</td><td class="row-label">OT Amount (₹${_fmt(rec.ot_rate||0)}/hr)</td><td>₹${_fmt(rec.ot_amount)}</td></tr>
-      <tr><td class="row-label">Absent Days</td><td>${rec.absent_days}</td><td class="row-label">Gross Pay</td><td><b>₹${_fmt(rec.gross_pay)}</b></td></tr>
+      <tr><td class="row-label">⏱ Total Worked Hours</td><td><b>${rec.total_worked_hours > 0 ? rec.total_worked_hours + ' hrs' : '—'}</b></td><td class="row-label">OT Hours</td><td>${_fmt(rec.ot_hours)} hrs</td></tr>
+      <tr><td class="row-label">Leaves Taken</td><td>${rec.leave_days}</td><td class="row-label">OT Amount (₹${_fmt(rec.ot_rate||0)}/hr)</td><td>₹${_fmt(rec.ot_amount)}</td></tr>
+      <tr><td class="row-label">Paid Leaves</td><td>${rec.paid_leaves}</td><td class="row-label">Gross Pay</td><td><b>₹${_fmt(rec.gross_pay)}</b></td></tr>
+      <tr><td class="row-label">Absent Days</td><td>${rec.absent_days}</td><td class="row-label"></td><td></td></tr>
     </table>
     <table>
       <tr><th colspan="2">📉 Deductions</th></tr>
@@ -698,7 +721,7 @@ const SSIPayroll = (() => {
       return true;
     });
 
-    const headers = ['Period','Emp Code','Name','Type','Unit','Monthly Sal','Days Present','Half Days','Leaves','Paid Leaves','OT Hrs','OT Amt','Deductions','Gross Pay','Net Pay','Status','Payment Mode','Payment Date','Remarks'];
+    const headers = ['Period','Emp Code','Name','Type','Unit','Monthly Sal','Days Present','Half Days','Leaves','Paid Leaves','Total Worked Hrs','OT Hrs','OT Amt','Deductions','Gross Pay','Net Pay','Status','Payment Mode','Payment Date','Remarks'];
     const rows = [headers];
     list.forEach(p => {
       const emp  = _findEmp(st, p);
@@ -706,7 +729,8 @@ const SSIPayroll = (() => {
       rows.push([
         p.period, emp?.emp_code||p.emp_code||'', emp?.name||p.emp_name||'', emp?.type||p.emp_type||'', unit?.name||p.unit_name||'',
         _r2(p.monthly_salary), p.present_days, p.half_days, p.leave_days, p.paid_leaves,
-        _r2(p.ot_hours), _r2(p.ot_amount), _r2(p.deductions), _r2(p.gross_pay), _r2(p.net_pay),
+        _r2(p.total_worked_hours||0), _r2(p.ot_hours), _r2(p.ot_amount),
+        _r2(p.deductions), _r2(p.gross_pay), _r2(p.net_pay),
         p.status, p.payment_mode||'', p.payment_date||'', p.remarks||''
       ]);
     });
