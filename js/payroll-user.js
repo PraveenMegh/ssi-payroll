@@ -396,7 +396,7 @@ const SSIPayroll = (() => {
     });
 
     // Build attendance lookup for this month
-    const attRecs = (st.attendance||[]).filter(a=>a.date&&a.date.startsWith(month));
+    const attRecs = (st.attendance||[]).filter(a=>a.date&&a.date.startsWith(month) && a.active !== false);
     const attMap  = {};
     attRecs.forEach(a => { attMap[`${a.emp_id}|${a.date}`] = a; });
 
@@ -407,24 +407,33 @@ const SSIPayroll = (() => {
       const existPaid = st.payroll.find(p=>p.emp_id===emp.id&&p.period===month&&p.status==='PAID');
       if (existPaid) { skipped++; return; }
 
-      let present=0, half=0, leaves=0, absent=0, woff=0, otHours=0;
+      let present=0, half=0, leaves=0, absent=0, woff=0, otHours=0, paidAttendanceDays=0, workHours=0;
       days.forEach(d => {
         const rec = attMap[`${emp.id}|${d}`];
         const s   = rec?.status || 'A';
-        if (s==='P')           { present++; if(rec?.ot_hours) otHours+=Number(rec.ot_hours); }
+        if (s==='P')           present++;
         else if (s==='A')      absent++;
-        else if (s==='H')      { half++; if(rec?.ot_hours) otHours+=Number(rec.ot_hours); }
+        else if (s==='H')      half++;
         else if (s==='L')      leaves++;
         else if (s==='WO'||s==='HD') woff++;
+
+        if (rec?.work_hours) workHours += Number(rec.work_hours) || 0;
+        if (rec?.ot_hours)   otHours   += Number(rec.ot_hours) || 0;
+        if (rec?.paid_days !== undefined) paidAttendanceDays += Number(rec.paid_days) || 0;
+        else if (s==='P') paidAttendanceDays += 1;
+        else if (s==='H') paidAttendanceDays += 0.5;
       });
+      otHours = Math.round(otHours * 100) / 100;
+      workHours = Math.round(workHours * 100) / 100;
+      paidAttendanceDays = Math.round(paidAttendanceDays * 100) / 100;
 
       // Paid leaves for STAFF (max 2)
       const paidLeaves = emp.type==='STAFF' ? Math.min(leaves, PAID_LEAVES_STAFF) : 0;
 
-      // Effective working days for salary calc
-      const effectiveDays = present + (half * 0.5) + paidLeaves;
-      const perDay        = Math.round(((emp.monthly_salary||0) / daysInMonth) * 100) / 100;
-      const otRate        = Math.round(((emp.monthly_salary||0) / daysInMonth / 8) * 100) / 100;
+      // Effective working days for salary calc. Salary is divided by 30 days, not calendar days.
+      const effectiveDays = Math.round((paidAttendanceDays + paidLeaves) * 100) / 100;
+      const perDay        = Math.round(((emp.monthly_salary||0) / 30) * 100) / 100;
+      const otRate        = Math.round(((emp.monthly_salary||0) / 30 / 8) * 100) / 100;
       const grossBase     = Math.round(perDay * effectiveDays * 100) / 100;
       const otAmount      = emp.type==='WORKER' ? Math.round(otHours * otRate * 100) / 100 : 0;
       const grossPay      = Math.round((grossBase + otAmount) * 100) / 100;
@@ -447,7 +456,7 @@ const SSIPayroll = (() => {
         unit_name:      (SSIApp.getState().units||[]).find(u=>u.id===emp.unit_id)?.name||'',
         period:         month,
         monthly_salary: emp.monthly_salary||0,
-        working_days:   daysInMonth,
+        working_days:   30,
         present_days:   present,
         half_days:      half,
         leave_days:     leaves,
@@ -455,6 +464,7 @@ const SSIPayroll = (() => {
         absent_days:    absent,
         week_offs:      woff,
         ot_hours:       otHours,
+        work_hours:     workHours,
         ot_rate:        otRate,
         ot_amount:      otAmount,
         gross_pay:      grossPay,
@@ -850,34 +860,36 @@ const SSIPayroll = (() => {
 
     // Get attendance for this employee for this month
     const attRecs = (st.attendance || []).filter(a => 
-      a.emp_id === empId && a.date && a.date.startsWith(month)
+      a.emp_id === empId && a.date && a.date.startsWith(month) && a.active !== false
     );
     const attMap = {};
     attRecs.forEach(a => { attMap[a.date] = a; });
 
-    // Calculate attendance stats
-    let present = 0, half = 0, leaves = 0, absent = 0, woff = 0, otHours = 0;
+    // Calculate attendance stats with hourly support
+    let present = 0, half = 0, leaves = 0, absent = 0, woff = 0, otHours = 0, paidAttendanceDays = 0, workHours = 0;
     days.forEach(d => {
       const rec = attMap[d];
       const s = rec?.status || 'A';
-      if (s === 'P') { 
-        present++; 
-        if (rec?.ot_hours) otHours += Number(rec.ot_hours); 
-      }
+      if (s === 'P') present++;
       else if (s === 'A') absent++;
-      else if (s === 'H') { 
-        half++; 
-        if (rec?.ot_hours) otHours += Number(rec.ot_hours); 
-      }
+      else if (s === 'H') half++;
       else if (s === 'L') leaves++;
       else if (s === 'WO' || s === 'HD') woff++;
+      if (rec?.work_hours) workHours += Number(rec.work_hours) || 0;
+      if (rec?.ot_hours) otHours += Number(rec.ot_hours) || 0;
+      if (rec?.paid_days !== undefined) paidAttendanceDays += Number(rec.paid_days) || 0;
+      else if (s === 'P') paidAttendanceDays += 1;
+      else if (s === 'H') paidAttendanceDays += 0.5;
     });
+    otHours = Math.round(otHours * 100) / 100;
+    workHours = Math.round(workHours * 100) / 100;
+    paidAttendanceDays = Math.round(paidAttendanceDays * 100) / 100;
 
-    // Calculate wages
+    // Calculate wages. Salary is divided by 30 days as per company rule.
     const paidLeaves = emp.type === 'STAFF' ? Math.min(leaves, PAID_LEAVES_STAFF) : 0;
-    const effectiveDays = present + (half * 0.5) + paidLeaves;
-    const perDay = Math.round(((emp.monthly_salary || 0) / daysInMonth) * 100) / 100;
-    const otRate = Math.round(((emp.monthly_salary || 0) / daysInMonth / 8) * 100) / 100;
+    const effectiveDays = Math.round((paidAttendanceDays + paidLeaves) * 100) / 100;
+    const perDay = Math.round(((emp.monthly_salary || 0) / 30) * 100) / 100;
+    const otRate = Math.round(((emp.monthly_salary || 0) / 30 / 8) * 100) / 100;
     const grossBase = Math.round(perDay * effectiveDays * 100) / 100;
     const otAmount = emp.type === 'WORKER' ? Math.round(otHours * otRate * 100) / 100 : 0;
     const grossPay = Math.round((grossBase + otAmount) * 100) / 100;
@@ -904,7 +916,7 @@ const SSIPayroll = (() => {
       unit_name: (st.units || []).find(u => u.id === emp.unit_id)?.name || '',
       period: month,
       monthly_salary: emp.monthly_salary || 0,
-      working_days: daysInMonth,
+      working_days: 30,
       present_days: present,
       half_days: half,
       leave_days: leaves,
@@ -912,6 +924,7 @@ const SSIPayroll = (() => {
       absent_days: absent,
       week_offs: woff,
       ot_hours: otHours,
+      work_hours: workHours,
       ot_rate: otRate,
       ot_amount: otAmount,
       gross_pay: grossPay,

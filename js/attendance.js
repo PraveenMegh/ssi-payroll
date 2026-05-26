@@ -46,6 +46,125 @@ const SSIAttendance = (() => {
     return `${months[parseInt(m)-1]} ${y}`;
   }
 
+
+
+  /* ── Hourly attendance rules ───────────────────────────────
+     Shift: Monday-Saturday 09:00 to 17:30
+     Lunch: 13:00 to 13:30 (deduct only if duty overlaps lunch)
+     Paid full day hours: 8.00 hours
+     Salary basis: monthly salary / 30 days
+     Examples:
+       09:00-18:00 => 8.5 net hrs => paid_days 1.00 + 0.5 OT
+       09:00-19:00 => 9.5 net hrs => paid_days 1.00 + 1.5 OT
+       09:00-16:00 => 6.5 net hrs => paid_days 0.8125 + 0 OT
+  */
+  const ATT_RULES = {
+    shiftStart: '09:00',
+    shiftEnd:   '17:30',
+    lunchStart: '13:00',
+    lunchEnd:   '13:30',
+    fullDayHours: 8,
+    payrollDays: 30,
+    otStep: 0.5,
+  };
+
+  function _r2(n) { return Math.round((Number(n)||0) * 100) / 100; }
+
+  function _timeToMinutes(t) {
+    if (!t) return null;
+    let v = String(t).trim().toLowerCase().replace(/\s+/g, '');
+    const m = v.match(/^(\d{1,2})(?::?(\d{2}))?(am|pm)?$/);
+    if (!m) return null;
+    let h = parseInt(m[1],10);
+    const min = parseInt(m[2] || '0',10);
+    const ap = m[3];
+    if (min < 0 || min > 59 || h < 0 || h > 23) return null;
+    if (ap) {
+      if (h < 1 || h > 12) return null;
+      if (ap === 'pm' && h !== 12) h += 12;
+      if (ap === 'am' && h === 12) h = 0;
+    }
+    return h * 60 + min;
+  }
+
+  function _minutesToTime(mins) {
+    if (mins === null || mins === undefined || isNaN(mins)) return '';
+    mins = ((Number(mins) % 1440) + 1440) % 1440;
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
+  }
+
+  function _lunchOverlapMinutes(inMin, outMin) {
+    const lunchStart = _timeToMinutes(ATT_RULES.lunchStart);
+    const lunchEnd   = _timeToMinutes(ATT_RULES.lunchEnd);
+    return Math.max(0, Math.min(outMin, lunchEnd) - Math.max(inMin, lunchStart));
+  }
+
+  function _roundDownToStep(hours, step) {
+    return Math.floor((Number(hours)||0) / step) * step;
+  }
+
+  function _calcHourlyAttendance(inTime, outTime, status='P') {
+    const inMin = _timeToMinutes(inTime);
+    let outMin  = _timeToMinutes(outTime);
+    if (inMin === null || outMin === null || outMin <= inMin) {
+      return { valid:false, in_time: inTime||'', out_time: outTime||'', work_hours:0, paid_days:0, ot_hours:0, auto_status: status||'A' };
+    }
+
+    const grossMins = outMin - inMin;
+    const lunchMins = _lunchOverlapMinutes(inMin, outMin);
+    const netHours  = _r2((grossMins - lunchMins) / 60);
+    const paidHours = Math.min(netHours, ATT_RULES.fullDayHours);
+    const paidDays  = _r2(paidHours / ATT_RULES.fullDayHours);
+    const otHours   = _r2(_roundDownToStep(Math.max(0, netHours - ATT_RULES.fullDayHours), ATT_RULES.otStep));
+
+    return {
+      valid:true,
+      in_time: _minutesToTime(inMin),
+      out_time: _minutesToTime(outMin),
+      work_hours: netHours,
+      paid_days: paidDays,
+      ot_hours: otHours,
+      auto_status: netHours > 0 ? 'P' : (status || 'A'),
+    };
+  }
+
+
+  function _backupAttendanceBeforeChange(st, reason='attendance-change') {
+    try {
+      const existing = Array.isArray(st.attendance) ? st.attendance : [];
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const backup = {
+        reason,
+        created_at: new Date().toISOString(),
+        records: JSON.parse(JSON.stringify(existing))
+      };
+      localStorage.setItem(`ssi_attendance_backup_${stamp}`, JSON.stringify(backup));
+      localStorage.setItem('ssi_attendance_backup_latest', JSON.stringify(backup));
+    } catch(e) {
+      console.warn('Attendance backup skipped:', e);
+    }
+  }
+
+  function _mergeAttendanceEntry(oldRec, newFields) {
+    // Preserve all old/custom fields and only update fields touched by attendance module.
+    return Object.assign({}, oldRec || {}, newFields || {});
+  }
+
+  function _applyHourlyFields(entry, inTime, outTime, manualOt, status) {
+    const calc = _calcHourlyAttendance(inTime, outTime, status);
+    entry.in_time = calc.valid ? calc.in_time : (inTime || '');
+    entry.out_time = calc.valid ? calc.out_time : (outTime || '');
+    entry.work_hours = calc.valid ? calc.work_hours : 0;
+    entry.paid_days = calc.valid ? calc.paid_days : (status==='P' ? 1 : status==='H' ? 0.5 : 0);
+    entry.ot_hours = (status==='P' || status==='H')
+      ? (calc.valid ? calc.ot_hours : (parseFloat(manualOt)||0))
+      : 0;
+    if (calc.valid) entry.status = calc.auto_status;
+    return entry;
+  }
+
   /* ── render ─────────────────────────────────────────────── */
   function render(area) {
     if (!SSIApp.hasRole('ADMIN','ACCOUNTANT','ACCOUNTS')) {
@@ -229,6 +348,7 @@ const SSIAttendance = (() => {
         const s   = rec?.status || '';
         const sm  = s ? STATUS_MAP[s] : null;
         const isDeleted = rec && !_isActive(rec);
+        const hrs = rec?.work_hours ? `<sup style="font-size:9px;color:#2563eb">${rec.work_hours}h</sup>` : '';
         const ot  = rec?.ot_hours ? `<sup style="font-size:9px;color:#f59e0b">+${rec.ot_hours}h</sup>` : '';
         const deletedStyle = isDeleted ? 'opacity:.45;text-decoration:line-through;' : '';
         const restoreBtn = (isDeleted && SSIApp.hasRole('ADMIN'))
@@ -240,7 +360,7 @@ const SSIAttendance = (() => {
             title="${sm?.label||'Not Marked'} ${rec?.ot_hours?'| OT:'+rec.ot_hours+'h':''}${isDeleted?' (DELETED)':''}"
             style="position:relative;display:inline-block;min-width:28px;padding:3px 2px;border-radius:6px;font-size:11px;font-weight:700;${isDeleted?'':'cursor:pointer;'}
               background:${sm?.bg||'#f3f4f6'};color:${sm?.color||'#9ca3af'};${deletedStyle}">
-            ${sm?.short||'—'}${ot}${restoreBtn}
+            ${sm?.short||'—'}${hrs}${ot}${restoreBtn}
           </span>
         </td>`;
       }).join('');
@@ -279,7 +399,7 @@ const SSIAttendance = (() => {
   }
 
   function _calcMonthSummary(empId, days, attMap, type) {
-    let p=0,a=0,h=0,l=0,wo=0,ot=0;
+    let p=0,a=0,h=0,l=0,wo=0,ot=0,hrs=0,paid=0;
     days.forEach(d => {
       const rec = attMap[`${empId}|${d}`];
       const s = rec?.status||'A';
@@ -288,11 +408,16 @@ const SSIAttendance = (() => {
       else if (s==='H') h++;
       else if (s==='L') l++;
       else if (s==='WO'||s==='HD') wo++;
+      if (rec?.work_hours) hrs += Number(rec.work_hours)||0;
+      if (rec?.paid_days !== undefined) paid += Number(rec.paid_days)||0;
+      else if (s==='P') paid += 1;
+      else if (s==='H') paid += 0.5;
       if (rec?.ot_hours) ot += Number(rec.ot_hours)||0;
     });
     const paidL = type==='STAFF' ? Math.min(l,2) : 0;
-    const eff   = p + (h*0.5) + paidL;
-    return `<span style="color:#166534;font-weight:600;">P:${p}</span> <span style="color:#991b1b;">A:${a}</span> <span style="color:#92400e;">H:${h}</span> <span style="color:#3730a3;">L:${l}</span>${ot>0?` <span style="color:#f59e0b;">OT:${ot}h</span>`:''}`;
+    paid = _r2(paid + paidL);
+    ot = _r2(ot); hrs = _r2(hrs);
+    return `<span style="color:#166534;font-weight:600;">Paid:${paid}d</span> <span style="color:#2563eb;">Hrs:${hrs}</span> <span style="color:#991b1b;">A:${a}</span>${ot>0?` <span style="color:#f59e0b;">OT:${ot}h</span>`:''}`;
   }
 
   /* ── Quick-edit single cell ──────────────────────────────── */
@@ -311,8 +436,12 @@ const SSIAttendance = (() => {
                 ${v.short} — ${v.label}
               </button>`).join('')}
           </div>
+          <div id="att-time-row" style="margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px;${currentStatus==='P'||currentStatus==='H'?'':'display:none;'}">
+            <div><label style="font-size:13px;">In Time</label><input type="time" id="att-in-input" value="${_getTime(empId, date, 'in_time')}" style="width:100%;margin-top:4px;"></div>
+            <div><label style="font-size:13px;">Out Time</label><input type="time" id="att-out-input" value="${_getTime(empId, date, 'out_time')}" style="width:100%;margin-top:4px;"></div>
+          </div>
           <div id="att-ot-row" style="margin-top:10px;${currentStatus==='P'||currentStatus==='H'?'':'display:none;'}">
-            <label style="font-size:13px;">OT Hours (Workers only)</label>
+            <label style="font-size:13px;">OT Hours (auto from time; manual if time blank)</label>
             <input type="number" id="att-ot-input" min="0" max="24" step="0.5" placeholder="0"
               style="width:100%;margin-top:4px;"
               value="${_getOT(empId, date)}">
@@ -333,6 +462,12 @@ const SSIAttendance = (() => {
     return rec?.ot_hours || 0;
   }
 
+  function _getTime(empId, date, field) {
+    const st  = SSIApp.getState();
+    const rec = (st.attendance||[]).find(a=>a.emp_id===empId&&a.date===date && _isActive(a));
+    return rec?.[field] || '';
+  }
+
   function _setStatus(empId, date, status) {
     document.querySelectorAll('#att-qe-overlay button[onclick*="_setStatus"]').forEach(b=>{
       b.style.borderWidth = '2px';
@@ -343,6 +478,8 @@ const SSIAttendance = (() => {
     document.getElementById('att-qe-overlay').setAttribute('data-status', status);
     const otRow = document.getElementById('att-ot-row');
     if (otRow) otRow.style.display = (status==='P'||status==='H') ? '' : 'none';
+    const timeRow = document.getElementById('att-time-row');
+    if (timeRow) timeRow.style.display = (status==='P'||status==='H') ? 'grid' : 'none';
   }
 
   async function _saveQuickEdit(empId, date) {
@@ -350,6 +487,8 @@ const SSIAttendance = (() => {
     const status  = overlay?.getAttribute('data-status');
     if (!status) { SSIApp.toast('Select a status first'); return; }
     const otHours = parseFloat(document.getElementById('att-ot-input')?.value) || 0;
+    const inTime  = document.getElementById('att-in-input')?.value || '';
+    const outTime = document.getElementById('att-out-input')?.value || '';
 
     const st  = SSIApp.getState();
     if (!st.attendance) st.attendance = [];
@@ -366,6 +505,8 @@ const SSIAttendance = (() => {
       created_at: idx>=0 ? st.attendance[idx].created_at : new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
+
+    _applyHourlyFields(entry, inTime, outTime, otHours, status);
 
     if (idx>=0) st.attendance[idx] = entry;
     else        st.attendance.push(entry);
@@ -392,13 +533,10 @@ const SSIAttendance = (() => {
             ${Object.entries(STATUS_MAP).map(([k,v])=>`<option value="${k}" ${s===k?'selected':''}>${v.short} — ${v.label}</option>`).join('')}
           </select>
         </td>
-        <td style="padding:10px 8px;">
-          <input type="number" id="bulk-ot-${e.id}"
-            min="0" max="24" step="0.5"
-            value="${rec?.ot_hours||''}"
-            placeholder="0"
-            title="Overtime hours (extra hours worked beyond normal shift)"
-            style="width:72px;padding:6px;border:1.5px solid #e2e8f0;border-radius:6px;font-size:13px;text-align:center;">
+        <td style="padding:10px 8px;white-space:nowrap;">
+          <input type="time" id="bulk-in-${e.id}" value="${rec?.in_time||''}" title="In time" style="width:105px;padding:6px;border:1.5px solid #e2e8f0;border-radius:6px;font-size:13px;">
+          <input type="time" id="bulk-out-${e.id}" value="${rec?.out_time||''}" title="Out time" style="width:105px;padding:6px;border:1.5px solid #e2e8f0;border-radius:6px;font-size:13px;margin-left:4px;">
+          <input type="number" id="bulk-ot-${e.id}" min="0" max="24" step="0.5" value="${rec?.ot_hours||''}" placeholder="OT" title="Manual OT only if time blank" style="width:60px;padding:6px;border:1.5px solid #e2e8f0;border-radius:6px;font-size:13px;text-align:center;margin-left:4px;">
         </td>
       </tr>`;
     }).join('');
@@ -425,7 +563,7 @@ const SSIAttendance = (() => {
               <tr style="background:#C0392B;position:sticky;top:0;z-index:2;">
                 <th style="padding:10px 8px;text-align:left;color:#fff;font-weight:600;">Employee</th>
                 <th style="padding:10px 8px;color:#fff;font-weight:600;">Status</th>
-                <th style="padding:10px 8px;color:#fff;font-weight:600;" title="Overtime hours worked beyond normal shift">OT Hrs <span style="font-size:10px;opacity:0.8;">(optional)</span></th>
+                <th style="padding:10px 8px;color:#fff;font-weight:600;" title="Enter In/Out time. Lunch 1:00-1:30 is deducted automatically.">In / Out / OT</th>
               </tr>
             </thead>
             <tbody id="bulk-tbody">
@@ -458,22 +596,29 @@ const SSIAttendance = (() => {
       const empId  = emp.id;
       const selEl  = document.getElementById(`bulk-s-${empId}`);
       const otEl   = document.getElementById(`bulk-ot-${empId}`);
+      const inEl   = document.getElementById(`bulk-in-${empId}`);
+      const outEl  = document.getElementById(`bulk-out-${empId}`);
       if (!selEl) return;
 
       const status  = selEl.value || 'P';
       const otHours = parseFloat(otEl?.value) || 0;
+      const inTime  = inEl?.value || '';
+      const outTime = outEl?.value || '';
       const idx     = st.attendance.findIndex(a=>a.emp_id===empId&&a.date===date && _isActive(a));
-      const entry   = {
-        id:         idx>=0 ? st.attendance[idx].id : SSIApp.uid(),
+      const oldRec = idx>=0 ? st.attendance[idx] : null;
+      let entry   = _mergeAttendanceEntry(oldRec, {
+        id:         oldRec?.id || SSIApp.uid(),
         emp_id:     empId,
         date,
         status,
         ot_hours:   (status==='P'||status==='H') ? otHours : 0,
         active:     true,
         user_id:    SSIApp.state.currentUser?.id||'',
-        created_at: idx>=0 ? st.attendance[idx].created_at : new Date().toISOString(),
+        created_at: oldRec?.created_at || new Date().toISOString(),
         updated_at: new Date().toISOString(),
-      };
+      });
+      _applyHourlyFields(entry, inTime, outTime, otHours, status);
+      if (saved === 0) _backupAttendanceBeforeChange(st, 'bulk-save');
       if (idx>=0) st.attendance[idx] = entry;
       else        st.attendance.push(entry);
       saved++;
@@ -488,11 +633,11 @@ const SSIAttendance = (() => {
   /* ── Template ─────────────────────────────────────────────── */
   function downloadTemplate() {
     const rows = [
-      ['emp_code','date','status','ot_hours'],
-      ['EMP-001','2024-03-01','P','0'],
-      ['EMP-001','2024-03-02','P','2'],
-      ['EMP-002','2024-03-01','A','0'],
-      ['EMP-002','2024-03-02','H','0'],
+      ['emp_code','date','status','in_time','out_time','ot_hours'],
+      ['EMP-001','2024-03-01','P','09:00','18:00',''],
+      ['EMP-001','2024-03-02','P','09:00','19:00',''],
+      ['EMP-002','2024-03-01','A','','','0'],
+      ['EMP-002','2024-03-02','P','09:00','16:00',''],
     ];
     SSIApp.excelDownload(rows, 'Attendance_Template', 'SSI_Attendance_Import_Template');
     SSIApp.toast('Template downloaded. Status codes: P=Present, A=Absent, H=Half Day, L=Leave, WO=Week Off, HD=Holiday');
@@ -520,6 +665,8 @@ const SSIAttendance = (() => {
       const iCode   = header.indexOf('emp_code');
       const iDate   = header.indexOf('date');
       const iStatus = header.indexOf('status');
+      const iIn     = header.indexOf('in_time');
+      const iOut    = header.indexOf('out_time');
       const iOT     = header.indexOf('ot_hours');
 
       if (iCode<0 || iDate<0 || iStatus<0) {
@@ -541,19 +688,24 @@ const SSIAttendance = (() => {
         const emp = (st.employees||[]).find(e=>e.emp_code===code);
         if (!emp) { skipped++; continue; }
 
+        const inTime  = iIn>=0 ? String(r[iIn]||'').trim() : '';
+        const outTime = iOut>=0 ? String(r[iOut]||'').trim() : '';
         const otHours = iOT>=0 ? parseFloat(r[iOT])||0 : 0;
         const idx = st.attendance.findIndex(a=>a.emp_id===emp.id&&a.date===date && _isActive(a));
-        const entry = {
-          id:         idx>=0 ? st.attendance[idx].id : SSIApp.uid(),
+        const oldRec = idx>=0 ? st.attendance[idx] : null;
+        let entry = _mergeAttendanceEntry(oldRec, {
+          id:         oldRec?.id || SSIApp.uid(),
           emp_id:     emp.id,
           date,
           status,
           ot_hours:   (status==='P'||status==='H') ? otHours : 0,
           active:     true,
           user_id:    SSIApp.state.currentUser?.id||'',
-          created_at: idx>=0 ? st.attendance[idx].created_at : new Date().toISOString(),
+          created_at: oldRec?.created_at || new Date().toISOString(),
           updated_at: new Date().toISOString(),
-        };
+        });
+        _applyHourlyFields(entry, inTime, outTime, otHours, status);
+        if (added === 0) _backupAttendanceBeforeChange(st, 'import');
         if (idx>=0) st.attendance[idx] = entry;
         else        st.attendance.push(entry);
         added++;
@@ -571,13 +723,13 @@ const SSIAttendance = (() => {
   function exportExcel() {
     const st    = SSIApp.getState();
     const month = document.getElementById('att-filter-month')?.value || new Date().toISOString().slice(0,7);
-    const rows  = [['Employee Code','Name','Type','Unit','Date','Status','Status Label','OT Hours','Active']];
+    const rows  = [['Employee Code','Name','Type','Unit','Date','Status','Status Label','In Time','Out Time','Work Hours','Paid Days','OT Hours','Active']];
     (st.attendance||[]).filter(a=>a.date&&a.date.startsWith(month)).forEach(a => {
       const emp  = (st.employees||[]).find(e=>e.id===a.emp_id);
       const unit = (st.units||[]).find(u=>u.id===emp?.unit_id);
       rows.push([
         emp?.emp_code||'', emp?.name||'', emp?.type||'', unit?.name||'',
-        a.date, a.status, STATUS_MAP[a.status]?.label||a.status, a.ot_hours||0,
+        a.date, a.status, STATUS_MAP[a.status]?.label||a.status, a.in_time||'', a.out_time||'', a.work_hours||0, a.paid_days ?? '', a.ot_hours||0,
         _isActive(a) ? 'YES' : 'NO (DELETED)'
       ]);
     });
