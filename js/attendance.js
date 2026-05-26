@@ -54,9 +54,9 @@ const SSIAttendance = (() => {
      Paid full day hours: 8.00 hours
      Salary basis: monthly salary / 30 days
      Examples:
-       09:00-18:00 => 8.5 net hrs => paid_days 1.00 + 0.5 OT
-       09:00-19:00 => 9.5 net hrs => paid_days 1.00 + 1.5 OT
-       09:00-16:00 => 6.5 net hrs => paid_days 0.8125 + 0 OT
+       09:00-18:00 => P + 0.5 OT (8 paid hrs + 0.5 extra)
+       09:00-19:00 => P + 1.5 OT (8 paid hrs + 1.5 extra)
+       09:00-16:00 => 6.5 payable hrs (paid_days 0.8125) + 0 OT
   */
   const ATT_RULES = {
     shiftStart: '09:00',
@@ -348,8 +348,12 @@ const SSIAttendance = (() => {
         const s   = rec?.status || '';
         const sm  = s ? STATUS_MAP[s] : null;
         const isDeleted = rec && !_isActive(rec);
-        const hrs = rec?.work_hours ? `<sup style="font-size:9px;color:#2563eb">${rec.work_hours}h</sup>` : '';
-        const ot  = rec?.ot_hours ? `<sup style="font-size:9px;color:#f59e0b">+${rec.ot_hours}h</sup>` : '';
+        // Display rule:
+        // - If net hours >= 8, show only P + OT (do NOT show 8.5h + 0.5h, which looks double-counted).
+        // - If net hours < 8, show payable hours, e.g. P6.5h.
+        const showPayableHours = rec?.work_hours && Number(rec.work_hours) > 0 && Number(rec.paid_days || 0) < 1;
+        const hrs = showPayableHours ? `<sup style="font-size:9px;color:#2563eb">${rec.work_hours}h</sup>` : '';
+        const ot  = rec?.ot_hours ? `<sup style="font-size:9px;color:#f59e0b">+${rec.ot_hours}h OT</sup>` : '';
         const deletedStyle = isDeleted ? 'opacity:.45;text-decoration:line-through;' : '';
         const restoreBtn = (isDeleted && SSIApp.hasRole('ADMIN'))
           ? `<button onclick="event.stopPropagation();SSIAttendance.restoreRecord('${rec.id}')"

@@ -360,12 +360,12 @@ const SSIPayroll = (() => {
           </select>
         </div>
         <div style="background:#e0f2fe;border-radius:8px;padding:10px;font-size:12px;color:#0369a1;">
-          <b>ℹ️ OT Rate</b><br>Auto = Monthly ÷ days ÷ 8 hrs<br>e.g. ₹15,000 salary in 31-day month = ₹60.48/hr</div>
+          <b>ℹ️ OT Rate</b><br>Auto = Monthly ÷ 30 ÷ 8 hrs<br>e.g. ₹15,000 salary = ₹62.50/hr</div>
       </div>
       <div style="background:#fef3c7;border-radius:8px;padding:12px;font-size:13px;margin-bottom:16px;">
         <b>ℹ️ Rules applied:</b><br>
-        • Per day salary = Monthly ÷ actual days in selected month (28/29/30/31)<br>
-        • OT rate = (Monthly Salary ÷ days ÷ 8) per hour — auto-calculated<br>
+        • Per day salary = Monthly ÷ 30 days<br>
+        • OT rate = (Monthly Salary ÷ 30 ÷ 8) per hour — auto-calculated<br>
         • Staff: up to ${PAID_LEAVES_STAFF} leaves/month counted as Present<br>
         • Workers: overtime eligible (Staff: no OT)<br>
         • EPF = 12% of basic earnings (employer), ESI = 0.75% if Gross ≤ ₹21,000<br>
