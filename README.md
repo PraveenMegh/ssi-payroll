@@ -1,44 +1,52 @@
-# SSI Inventory Management System v9
-## Shree Sai Industries — Production Ready
+# SSI Operations Streamlit App v2 — Data-Safe Operations Module
 
-### 🔐 Default Login Credentials
-| Role     | Username   | Password     |
-|----------|------------|--------------|
-| Admin    | admin      | admin123     |
-| Stock    | stock1     | stock123     |
-| Dispatch | dispatch1  | dispatch123  |
-| Sales 1  | sales1     | sales123     |
-| Sales 2  | sales2     | sales123     |
+This app is for **operations only**:
+- Products
+- Clients / Vendors
+- Inventory
+- Sales Orders
+- Dispatch
+- Reports
+- Backup / Import / Export
 
-### 🚀 Quick Start (Local)
-**Mac/Linux:**
+These stay in the existing Render payroll app:
+- Payroll
+- Attendance
+- Employees
+
+## Important data safety points
+
+1. Import stores a full backup first.
+2. Payroll / Attendance / Employees are skipped by default.
+3. Old inventory rows are not deleted.
+4. Old inventory can be converted into stock ledger movements.
+5. Dispatch deducts stock through stock movement records.
+6. Current stock is calculated from the stock ledger, not overwritten manually.
+
+## Recommended live database
+
+For Streamlit Cloud, use Supabase/PostgreSQL and set:
+
 ```bash
-cd ~/Downloads/ssi-inventory-v9
-python3 -m http.server 8000
+DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/postgres
 ```
-**Windows:**
-```cmd
-cd C:\Users\YourName\Downloads\ssi-inventory-v9
-python -m http.server 8000
+
+SQLite is okay only for local testing.
+
+## Run locally
+
+```bash
+pip install -r requirements.txt
+streamlit run streamlit_app.py
 ```
-Open browser → http://localhost:8000
 
-### 🌐 Deployed URL
-https://ssi-inventory-hmwp.onrender.com
+## Migration flow
 
-### 📋 Feature Summary
-- ✅ Role-based access (Admin / Sales / Stock / Dispatch)
-- ✅ Products with SKU, pack sizes, carton standard, reorder alerts
-- ✅ Clients/Vendors with GST Number, address, phone
-- ✅ Smart Inventory IN/OUT (Bags × Size, Cartons, Direct KG, NOS)
-- ✅ Sales Orders (Bag × Count = Total KG, Urgent flag)
-- ✅ Salesperson sees ONLY own orders + dispatch status
-- ✅ Dispatch queue (Urgent first → FIFO) + History
-- ✅ Demand Analysis (product trends, top clients)
-- ✅ Monthly reports + Salesperson performance
-- ✅ Excel import/export everywhere
-- ✅ Multi-currency (INR/USD/EUR/GBP)
-
-### 🔄 To Deploy on Render.com
-1. Replace files in GitHub repo (PraveenMegh/ssi-inventory)
-2. Render auto-deploys on push
+1. Export JSON backup from old Render/Firebase app.
+2. Deploy this app.
+3. Open **Migration / Backup**.
+4. Upload JSON.
+5. Keep payroll checkbox unchecked.
+6. Verify Products, Clients, Inventory, Orders.
+7. Export a new JSON backup from Streamlit.
+8. Then start using operations in Streamlit.
