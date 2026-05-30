@@ -73,7 +73,7 @@ const SSIAuth = (() => {
     if (topRole) topRole.textContent = user.role;
 
     const defaultPage = {
-      ADMIN:'payroll', ACCOUNTANT:'payroll', ACCOUNTS:'payroll'
+      ADMIN:'dashboard', ACCOUNTANT:'dashboard', ACCOUNTS:'dashboard'
     };
     SSIApp.navigate(defaultPage[user.role] || 'dashboard');
   }
