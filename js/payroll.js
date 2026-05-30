@@ -28,6 +28,37 @@ const SSIPayroll = (() => {
     return Math.round((Number(n) || 0) * 100) / 100;
   }
 
+  function _todayISO() { return new Date().toISOString().slice(0,10); }
+
+  // Payroll month freezes on 15th of next month. Example: May 2026 freezes on 15 June 2026.
+  function _freezeDate(period) {
+    if (!period) return '';
+    const [y,m] = period.split('-').map(Number);
+    const d = new Date(y, m, 15); // JS month is zero-based; m = next month
+    return d.toISOString().slice(0,10);
+  }
+
+  function _isFrozen(period) {
+    if (!period) return false;
+    return _todayISO() >= _freezeDate(period);
+  }
+
+  function _paidAmount(p) { return _money(p.paid_amount ?? (p.status === 'PAID' ? p.net_pay : 0)); }
+  function _balanceAmount(p) { return Math.max(0, _money((p.net_pay||0) - _paidAmount(p))); }
+  function _arrearAmount(p) { return _money(p.arrear_amount || 0); }
+
+  function _monthsBetweenInclusive(fromYM, toYM) {
+    if (!fromYM || !toYM) return [];
+    let [fy,fm] = fromYM.split('-').map(Number);
+    const [ty,tm] = toYM.split('-').map(Number);
+    const out = [];
+    while (fy < ty || (fy === ty && fm <= tm)) {
+      out.push(`${fy}-${String(fm).padStart(2,'0')}`);
+      fm++; if (fm > 12) { fm = 1; fy++; }
+    }
+    return out;
+  }
+
   /* ── Employee lookup helper (3-tier: id → emp_code → null) ─
      Handles the case where employees were deleted and re-imported
      with new IDs after payroll records were already generated.  */
@@ -159,7 +190,9 @@ const SSIPayroll = (() => {
         <h2 class="page-title">💰 Payroll</h2>
         <div style="display:flex;gap:10px;flex-wrap:wrap;">
           <button class="btn btn-secondary btn-sm" onclick="SSIApp.navigate('attendance')">🗓️ Attendance Panel</button>
+          ${SSIApp.hasRole('ADMIN') ? `<button class="btn btn-secondary btn-sm" onclick="SSIPayroll.openSalaryRevision()">📈 Salary Revision / Arrear</button>` : ''}
           <button class="btn btn-secondary btn-sm" onclick="SSIPayroll.openBulkDeduction()">➖ Deduction Panel</button>
+          <button class="btn btn-secondary btn-sm" onclick="SSIPayroll.openRevisionLog()">🧾 Revision Log</button>
           <button class="btn btn-secondary btn-sm" onclick="SSIPayroll.exportExcel()">📤 Export</button>
           <button class="btn btn-primary" onclick="SSIPayroll.openGenerateModal()">⚙️ Generate Payroll</button>
         </div>
@@ -167,6 +200,7 @@ const SSIPayroll = (() => {
 
       <!-- Orphan warning banner -->
       <div id="pr-orphan-banner" style="display:none;background:#fef3c7;border:1px solid #f59e0b;border-radius:10px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:#92400e;"></div>
+      <div id="pr-freeze-banner" style="display:none;background:#eff6ff;border:1px solid #60a5fa;border-radius:10px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:#1d4ed8;"></div>
 
       <!-- Period selector -->
       <div class="card" style="margin-bottom:16px;padding:16px;">
@@ -220,13 +254,17 @@ const SSIPayroll = (() => {
             <th style="text-align:center;">Pay Days</th>
             <th style="text-align:right;">OT Hrs</th>
             <th style="text-align:right;">OT Amt</th>
+            <th style="text-align:right;">Arrear</th>
             <th style="text-align:right;">Deduct.</th>
             <th style="text-align:right;">Gross</th>
             <th style="text-align:right;">Net Pay</th>
+            <th style="text-align:right;">Paid Amt</th>
+            <th style="text-align:right;">Balance</th>
+            <th>Payment</th>
             <th>Status</th>
             <th>Actions</th>
           </tr></thead>
-          <tbody id="pr-tbody"><tr><td colspan="16" style="text-align:center;padding:40px;color:#94a3b8;">Select a month and generate payroll to begin.</td></tr></tbody>
+          <tbody id="pr-tbody"><tr><td colspan="20" style="text-align:center;padding:40px;color:#94a3b8;">Select a month and generate payroll to begin.</td></tr></tbody>
         </table>
         <div id="pr-total-row" style="padding:12px 16px;font-size:13px;color:#64748b;text-align:right;"></div>
       </div>`;
@@ -266,6 +304,9 @@ const SSIPayroll = (() => {
     const totalGross  = _r2(list.reduce((s,p)=>s+_r2(p.gross_pay),0));
     const totalOT     = _r2(list.reduce((s,p)=>s+_r2(p.ot_amount),0));
     const totalDeduct = _r2(list.reduce((s,p)=>s+_r2(p.deductions),0));
+    const totalPaid   = _money(list.reduce((s,p)=>s+_paidAmount(p),0));
+    const totalBal    = _money(list.reduce((s,p)=>s+_balanceAmount(p),0));
+    const totalArrear = _money(list.reduce((s,p)=>s+_arrearAmount(p),0));
     const paidCount   = list.filter(p=>p.status==='PAID').length;
 
     const summaryEl = document.getElementById('pr-summary');
@@ -274,10 +315,23 @@ const SSIPayroll = (() => {
         <div style="background:#FDECEA;padding:14px 16px;border-radius:10px;"><div style="font-size:22px;font-weight:800;color:#922B21;">${list.length}</div><div style="font-size:12px;color:#922B21;">Records</div></div>
         <div style="background:#dcfce7;padding:14px 16px;border-radius:10px;"><div style="font-size:22px;font-weight:800;color:#166534;">₹${_fmt(totalGross)}</div><div style="font-size:12px;color:#166534;">Gross Pay</div></div>
         <div style="background:#fef3c7;padding:14px 16px;border-radius:10px;"><div style="font-size:22px;font-weight:800;color:#92400e;">₹${_fmt(totalOT)}</div><div style="font-size:12px;color:#92400e;">OT Amount</div></div>
+        <div style="background:#e0f2fe;padding:14px 16px;border-radius:10px;"><div style="font-size:22px;font-weight:800;color:#0369a1;">₹${_fmt(totalArrear)}</div><div style="font-size:12px;color:#0369a1;">Arrears</div></div>
         <div style="background:#fee2e2;padding:14px 16px;border-radius:10px;"><div style="font-size:22px;font-weight:800;color:#991b1b;">₹${_fmt(totalDeduct)}</div><div style="font-size:12px;color:#991b1b;">Deductions</div></div>
         <div style="background:#f0fdf4;padding:14px 16px;border-radius:10px;border:2px solid #166534;"><div style="font-size:22px;font-weight:800;color:#166534;">₹${_fmt(totalNet)}</div><div style="font-size:12px;color:#166534;">Net Payable</div></div>
-        <div style="background:#f5f3ff;padding:14px 16px;border-radius:10px;"><div style="font-size:22px;font-weight:800;color:#5b21b6;">${paidCount}/${list.length}</div><div style="font-size:12px;color:#5b21b6;">Paid</div></div>
+        <div style="background:#dcfce7;padding:14px 16px;border-radius:10px;"><div style="font-size:22px;font-weight:800;color:#166534;">₹${_fmt(totalPaid)}</div><div style="font-size:12px;color:#166534;">Amount Paid</div></div>
+        <div style="background:#fff7ed;padding:14px 16px;border-radius:10px;"><div style="font-size:22px;font-weight:800;color:#c2410c;">₹${_fmt(totalBal)}</div><div style="font-size:12px;color:#c2410c;">Pending</div></div>
+        <div style="background:#f5f3ff;padding:14px 16px;border-radius:10px;"><div style="font-size:22px;font-weight:800;color:#5b21b6;">${paidCount}/${list.length}</div><div style="font-size:12px;color:#5b21b6;">Paid Employees</div></div>
       </div>`;
+
+    const freezeBanner = document.getElementById('pr-freeze-banner');
+    if (freezeBanner) {
+      if (period && _isFrozen(period)) {
+        freezeBanner.style.display = 'block';
+        freezeBanner.innerHTML = `🔒 <b>${_fmtPeriod(period)} is frozen</b> from ${_freezeDate(period)}. Viewing/export is allowed. Edits create revision logs; old paid records are not deleted.`;
+      } else {
+        freezeBanner.style.display = 'none';
+      }
+    }
 
     const tbody = document.getElementById('pr-tbody');
     if (!tbody) return;
@@ -293,7 +347,7 @@ const SSIPayroll = (() => {
       }
     }
 
-    if (!list.length) { tbody.innerHTML = `<tr><td colspan="16" style="text-align:center;padding:40px;color:#94a3b8;">No payroll records found.</td></tr>`; return; }
+    if (!list.length) { tbody.innerHTML = `<tr><td colspan="20" style="text-align:center;padding:40px;color:#94a3b8;">No payroll records found.</td></tr>`; return; }
 
     tbody.innerHTML = list.map(p => {
       const emp  = _findEmp(st, p);
@@ -305,7 +359,11 @@ const SSIPayroll = (() => {
       const deduct  = _r2(p.deductions);
       const gross   = _r2(p.gross_pay);
       const netPay  = _r2(p.net_pay);
+      const paidAmt = _paidAmount(p);
+      const balAmt  = _balanceAmount(p);
+      const arrear  = _arrearAmount(p);
       const monthly = _r2(p.monthly_salary);
+      const frozen = _isFrozen(p.period);
       return `<tr>
         <td style="white-space:nowrap;">${_fmtPeriod(p.period)}</td>
         <td><b>${dName}</b><br><span style="font-size:11px;color:#64748b;">${dCode}</span></td>
@@ -318,14 +376,19 @@ const SSIPayroll = (() => {
         <td style="text-align:center;color:#3730a3;font-weight:600;">${_fmtQty(p.payable_days ?? (p.present_days + (p.half_days||0)*0.5 + (p.paid_leaves||0)))}</td>
         <td style="text-align:right;">${_fmt(otHrs)}</td>
         <td style="text-align:right;color:#f59e0b;font-weight:600;">${otAmt>0?'₹'+_fmt(otAmt):'—'}</td>
+        <td style="text-align:right;color:#0369a1;font-weight:700;">${arrear>0?'₹'+_fmt(arrear):'—'}</td>
         <td style="text-align:right;color:#991b1b;">${deduct>0?'₹'+_fmt(deduct):'—'}</td>
         <td style="text-align:right;font-weight:600;">₹${_fmt(gross)}</td>
         <td style="text-align:right;font-weight:800;font-size:15px;color:#166534;">₹${_fmt(netPay)}</td>
-        <td>${st_badge}</td>
+        <td style="text-align:right;color:#166534;font-weight:700;">${paidAmt>0?'₹'+_fmt(paidAmt):'—'}</td>
+        <td style="text-align:right;color:${balAmt>0?'#c2410c':'#64748b'};font-weight:700;">${balAmt>0?'₹'+_fmt(balAmt):'—'}</td>
+        <td style="font-size:11px;color:#64748b;">${p.payment_date||''}<br>${p.payment_mode||''}</td>
+        <td>${st_badge}${frozen?'<br><span style="font-size:10px;color:#1d4ed8;">🔒 Frozen</span>':''}</td>
         <td style="white-space:nowrap;">
-          ${p.status!=='PAID' ? `<button class="btn btn-secondary btn-sm" onclick="SSIPayroll.openEdit('${p.id}')" title="Edit deductions/remarks">✏️</button>` : ''}
-          ${(p.status!=='PAID'&&SSIApp.hasRole('ADMIN')) ? `<button class="btn btn-danger btn-sm" onclick="SSIPayroll.deletePayroll('${p.id}')" title="Delete record">🗑️</button>` : ''}
-          ${p.status!=='PAID' ? `<button class="btn btn-primary btn-sm" onclick="SSIPayroll.markPaid('${p.id}')" title="Mark as Paid" style="font-size:11px;">✅ Paid</button>` : ''}
+          ${(p.status!=='PAID' && !frozen) ? `<button class="btn btn-secondary btn-sm" onclick="SSIPayroll.openEdit('${p.id}')" title="Edit deductions/remarks">✏️</button>` : ''}
+          ${(p.status!=='PAID'&&SSIApp.hasRole('ADMIN')&&!frozen) ? `<button class="btn btn-danger btn-sm" onclick="SSIPayroll.deletePayroll('${p.id}')" title="Delete record">🗑️</button>` : ''}
+          ${(p.status!=='PAID' || balAmt>0) ? `<button class="btn btn-primary btn-sm" onclick="SSIPayroll.openPayment('${p.id}')" title="Record payment" style="font-size:11px;">💳 Pay</button>` : ''}
+          ${p.status==='PAID' ? `<button class="btn btn-secondary btn-sm" onclick="SSIPayroll.openRevision('${p.id}')" title="Post-payment revision">🔁 Revise</button>` : ''}
           <button class="btn btn-secondary btn-sm" onclick="SSIPayroll.printSlip('${p.id}')" title="Print Slip">🖨️</button>
         </td>
       </tr>`;
@@ -452,9 +515,9 @@ const SSIPayroll = (() => {
       const otRate        = _r2((emp.monthly_salary||0) / 30 / 8);
       const grossBase     = _money(perDay * effectiveDays);
       const otAmount      = _money(otHours * otRate);
-      const grossPay      = _money(grossBase + otAmount);
-
       const existing      = st.payroll.find(p=>p.emp_id===emp.id&&p.period===month);
+      const existingArrear = _money(existing?.arrear_amount || 0);
+      const grossPay      = _money(grossBase + otAmount + existingArrear);
       const advance       = _money(existing?.advance || 0);
       const otherDeduct   = _money(existing?.other_deduction || 0);
       const epfAmount     = _money(grossBase * EPF_RATE);
@@ -486,6 +549,7 @@ const SSIPayroll = (() => {
         work_hours:     workHours,
         ot_rate:        otRate,
         ot_amount:      otAmount,
+        arrear_amount:   existingArrear,
         gross_pay:      grossPay,
         advance:        advance,
         other_deduction: otherDeduct,
@@ -625,17 +689,147 @@ const SSIPayroll = (() => {
     applyFilter();
   }
 
-  /* ── Mark as Paid ────────────────────────────────────────── */
-  async function markPaid(recId) {
+  /* ── Payment Tracking ────────────────────────────────────── */
+  function openPayment(recId) {
+    const st  = SSIApp.getState();
+    const rec = (st.payroll||[]).find(p=>p.id===recId);
+    if (!rec) return;
+    const emp = _findEmp(st, rec);
+    const paidSoFar = _paidAmount(rec);
+    const balance = _balanceAmount(rec);
+    const suggested = balance > 0 ? balance : Math.max(0, _money(rec.net_pay||0) - paidSoFar);
+    SSIApp.modal(`
+      <h3 style="margin-bottom:14px;">💳 Record Payment — ${emp?.name||rec.emp_name||''}</h3>
+      <div style="background:#f8fafc;border-radius:10px;padding:12px;margin-bottom:14px;font-size:13px;display:grid;grid-template-columns:repeat(3,1fr);gap:10px;">
+        <div>Net Payable<br><b style="font-size:18px;color:#166534;">₹${_fmt(rec.net_pay)}</b></div>
+        <div>Already Paid<br><b style="font-size:18px;color:#0369a1;">₹${_fmt(paidSoFar)}</b></div>
+        <div>Balance<br><b style="font-size:18px;color:#c2410c;">₹${_fmt(balance)}</b></div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+        <div><label>Amount Paid Now ₹</label><input type="number" id="pay-amount" min="0" step="1" value="${suggested || rec.net_pay || 0}"></div>
+        <div><label>Payment Date</label><input type="date" id="pay-date" value="${rec.payment_date || _todayISO()}"></div>
+        <div><label>Payment Mode</label><select id="pay-mode"><option value="BANK" ${rec.payment_mode==='BANK'?'selected':''}>Bank Transfer</option><option value="CASH" ${rec.payment_mode==='CASH'?'selected':''}>Cash</option><option value="UPI" ${rec.payment_mode==='UPI'?'selected':''}>UPI</option><option value="CHEQUE" ${rec.payment_mode==='CHEQUE'?'selected':''}>Cheque</option></select></div>
+        <div><label>Remarks</label><input id="pay-remarks" value="${rec.payment_remarks||rec.remarks||''}" placeholder="Payment reference / note"></div>
+      </div>
+      <div style="background:#eff6ff;border-radius:8px;padding:10px;margin-top:14px;font-size:13px;color:#1d4ed8;">
+        Partial payment is allowed. Status becomes PAID only when paid amount is equal to or greater than net payable.
+      </div>
+      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;">
+        <button class="btn btn-secondary" onclick="SSIApp.closeModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="SSIPayroll.savePayment('${recId}')">💾 Save Payment</button>
+      </div>`);
+  }
+
+  async function savePayment(recId) {
     const st  = SSIApp.getState();
     const idx = (st.payroll||[]).findIndex(p=>p.id===recId);
     if (idx<0) return;
-    const ok  = await SSIApp.confirm(`Mark this payroll as PAID?\nPayment date: ${new Date().toLocaleDateString('en-IN')}\nThis cannot be undone.`);
-    if (!ok) return;
-    st.payroll[idx] = { ...st.payroll[idx], status:'PAID', payment_date: new Date().toISOString().slice(0,10) };
+    const rec = st.payroll[idx];
+    const amountNow = Math.max(0, _money(parseFloat(document.getElementById('pay-amount')?.value)||0));
+    if (amountNow <= 0) { SSIApp.toast('Enter amount paid'); return; }
+    const prevPaid = _paidAmount(rec);
+    const newPaid = _money(prevPaid + amountNow);
+    const balance = Math.max(0, _money((rec.net_pay||0) - newPaid));
+    if (!st.payment_history) st.payment_history = [];
+    st.payment_history.push({
+      id: SSIApp.uid(), payroll_id: rec.id, emp_id: rec.emp_id, period: rec.period,
+      amount: amountNow, payment_date: document.getElementById('pay-date')?.value || _todayISO(),
+      payment_mode: document.getElementById('pay-mode')?.value || '',
+      remarks: document.getElementById('pay-remarks')?.value.trim() || '',
+      created_by: SSIApp.state.currentUser?.username || '', created_at: new Date().toISOString()
+    });
+    st.payroll[idx] = {
+      ...rec,
+      paid_amount: newPaid,
+      balance_amount: balance,
+      payment_date: document.getElementById('pay-date')?.value || _todayISO(),
+      payment_mode: document.getElementById('pay-mode')?.value || '',
+      payment_remarks: document.getElementById('pay-remarks')?.value.trim() || '',
+      status: balance <= 0 ? 'PAID' : 'PARTIAL',
+      updated_at: new Date().toISOString()
+    };
     await SSIApp.saveState(st);
-    SSIApp.audit('PAYROLL_PAID', `Marked paid: ${st.payroll[idx].emp_id} period ${st.payroll[idx].period}`);
-    SSIApp.toast('✅ Marked as Paid');
+    SSIApp.audit('PAYROLL_PAYMENT', `Payment ₹${amountNow} for ${rec.emp_id} period ${rec.period}`);
+    SSIApp.toast(balance <= 0 ? '✅ Payment completed' : `✅ Partial payment saved. Balance ₹${_fmt(balance)}`);
+    SSIApp.closeModal();
+    applyFilter();
+  }
+
+  async function markPaid(recId) { openPayment(recId); }
+
+  /* ── Post-payment Revision ───────────────────────────────── */
+  function openRevision(recId) {
+    if (!SSIApp.hasRole('ADMIN','ACCOUNTS','ACCOUNTANT')) return;
+    const st  = SSIApp.getState();
+    const rec = (st.payroll||[]).find(p=>p.id===recId);
+    if (!rec) return;
+    const emp = _findEmp(st, rec);
+    SSIApp.modal(`
+      <h3 style="margin-bottom:14px;">🔁 Payroll Revision — ${emp?.name||rec.emp_name||''}</h3>
+      <div style="background:#f8fafc;border-radius:10px;padding:12px;margin-bottom:14px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;font-size:13px;">
+        <div>Paid Amount<br><b>₹${_fmt(_paidAmount(rec))}</b></div>
+        <div>Current Net<br><b>₹${_fmt(rec.net_pay)}</b></div>
+        <div>Period<br><b>${_fmtPeriod(rec.period)}</b></div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+        <div><label>Revised Net Pay ₹</label><input type="number" id="rev-net" step="1" value="${_money(rec.net_pay||0)}" oninput="SSIPayroll.previewRevision('${recId}')"></div>
+        <div><label>Adjustment Option</label><select id="rev-option"><option value="SAME_MONTH">Recover/Pay in same month</option><option value="NEXT_MONTH">Adjust in next month</option><option value="WAIVE">Waive difference</option></select></div>
+      </div>
+      <label style="display:block;margin-top:12px;">Reason</label><input id="rev-reason" placeholder="Attendance correction / deduction correction / other reason">
+      <div id="rev-preview" style="background:#fff7ed;border-radius:8px;padding:12px;margin-top:14px;font-size:13px;color:#9a3412;"></div>
+      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;">
+        <button class="btn btn-secondary" onclick="SSIApp.closeModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="SSIPayroll.saveRevision('${recId}')">💾 Save Revision</button>
+      </div>`);
+    previewRevision(recId);
+  }
+
+  function previewRevision(recId) {
+    const st  = SSIApp.getState();
+    const rec = (st.payroll||[]).find(p=>p.id===recId);
+    if (!rec) return;
+    const revised = _money(parseFloat(document.getElementById('rev-net')?.value)||0);
+    const paid = _paidAmount(rec);
+    const diff = _money(revised - paid);
+    const el = document.getElementById('rev-preview');
+    if (!el) return;
+    if (diff > 0) el.innerHTML = `Employee should receive extra <b>₹${_fmt(diff)}</b>.`;
+    else if (diff < 0) el.innerHTML = `Employee was overpaid by <b>₹${_fmt(Math.abs(diff))}</b>. Recover same month or next month.`;
+    else el.innerHTML = `No difference.`;
+  }
+
+  async function saveRevision(recId) {
+    const st  = SSIApp.getState();
+    const idx = (st.payroll||[]).findIndex(p=>p.id===recId);
+    if (idx<0) return;
+    const rec = st.payroll[idx];
+    const revised = _money(parseFloat(document.getElementById('rev-net')?.value)||0);
+    const paid = _paidAmount(rec);
+    const diff = _money(revised - paid);
+    const option = document.getElementById('rev-option')?.value || 'SAME_MONTH';
+    const reason = document.getElementById('rev-reason')?.value.trim() || 'Payroll revision';
+    if (!st.payroll_revisions) st.payroll_revisions = [];
+    const rev = { id: SSIApp.uid(), payroll_id: rec.id, emp_id: rec.emp_id, period: rec.period,
+      old_net_pay: _money(rec.net_pay), paid_amount: paid, revised_net_pay: revised, difference: diff,
+      adjustment_option: option, reason, revised_by: SSIApp.state.currentUser?.username||'', revised_at: new Date().toISOString() };
+    st.payroll_revisions.push(rev);
+    const updated = { ...rec, revised_net_pay: revised, revision_difference: diff, revision_status: option, revision_reason: reason, updated_at: new Date().toISOString() };
+    if (option === 'SAME_MONTH') {
+      updated.net_pay = revised;
+      updated.balance_amount = Math.max(0, _money(revised - paid));
+      updated.status = updated.balance_amount <= 0 ? 'PAID' : 'PARTIAL';
+    } else if (option === 'NEXT_MONTH' && diff < 0) {
+      if (!st.next_month_adjustments) st.next_month_adjustments = [];
+      st.next_month_adjustments.push({ id: SSIApp.uid(), emp_id: rec.emp_id, source_period: rec.period, amount: Math.abs(diff), type: 'RECOVERY', reason, created_at: new Date().toISOString() });
+    } else if (option === 'NEXT_MONTH' && diff > 0) {
+      if (!st.next_month_adjustments) st.next_month_adjustments = [];
+      st.next_month_adjustments.push({ id: SSIApp.uid(), emp_id: rec.emp_id, source_period: rec.period, amount: diff, type: 'ARREAR', reason, created_at: new Date().toISOString() });
+    }
+    st.payroll[idx] = updated;
+    await SSIApp.saveState(st);
+    SSIApp.audit('PAYROLL_REVISION', `Revision for ${rec.emp_id} ${rec.period}: ₹${diff}`);
+    SSIApp.closeModal();
+    SSIApp.toast('✅ Payroll revision saved with audit log');
     applyFilter();
   }
 
@@ -686,7 +880,10 @@ const SSIPayroll = (() => {
       <tr><td class="row-label"><b>Total Deductions</b></td><td><b>₹${_fmt(rec.deductions||0)}</b></td></tr>
     </table>
     <table>
-      <tr class="total"><td>NET PAY</td><td style="text-align:right;font-size:18px;">₹${_fmt(rec.net_pay)}</td></tr>
+      <tr><td class="row-label">Arrear</td><td style="text-align:right;">₹${_fmt(rec.arrear_amount||0)}</td></tr>
+      <tr class="total"><td>NET PAYABLE</td><td style="text-align:right;font-size:18px;">₹${_fmt(rec.net_pay)}</td></tr>
+      <tr><td class="row-label">Paid Amount</td><td style="text-align:right;">₹${_fmt(_paidAmount(rec))}</td></tr>
+      <tr><td class="row-label">Balance</td><td style="text-align:right;">₹${_fmt(_balanceAmount(rec))}</td></tr>
     </table>
     ${rec.payment_mode ? `<p style="font-size:12px;color:#64748b;">Payment Mode: ${rec.payment_mode} ${rec.payment_date?'| Date: '+rec.payment_date:''}</p>` : ''}
     <div class="footer">
@@ -778,6 +975,100 @@ const SSIPayroll = (() => {
     applyFilter();
   }
 
+  /* ── Admin-only Salary Revision / Arrear ─────────────────── */
+  function openSalaryRevision() {
+    if (!SSIApp.hasRole('ADMIN')) { SSIApp.toast('🔒 Admin only'); return; }
+    const st = SSIApp.getState();
+    const emps = (st.employees||[]).filter(e=>e.active!==false);
+    const current = new Date().toISOString().slice(0,7);
+    SSIApp.modal(`
+      <h3 style="margin-bottom:14px;">📈 Salary Revision / Arrear</h3>
+      <div style="background:#eff6ff;border-radius:8px;padding:10px;margin-bottom:12px;font-size:13px;color:#1d4ed8;">
+        Frozen past months will not be changed. Arrear is calculated and added to current selected payroll month.
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+        <div><label>Employee</label><select id="salrev-emp" onchange="SSIPayroll.previewSalaryRevision()"><option value="">Select employee</option>${emps.map(e=>`<option value="${e.id}" data-sal="${e.monthly_salary||0}">${e.emp_code||''} - ${e.name} (₹${_fmt(e.monthly_salary||0)})</option>`).join('')}</select></div>
+        <div><label>Pay Arrear In Month</label><input type="month" id="salrev-paymonth" value="${current}" onchange="SSIPayroll.previewSalaryRevision()"></div>
+        <div><label>Old Salary ₹</label><input type="number" id="salrev-old" step="1" value="0" oninput="SSIPayroll.previewSalaryRevision()"></div>
+        <div><label>New Salary ₹</label><input type="number" id="salrev-new" step="1" value="0" oninput="SSIPayroll.previewSalaryRevision()"></div>
+        <div><label>Effective From</label><input type="month" id="salrev-from" value="${current}" onchange="SSIPayroll.previewSalaryRevision()"></div>
+        <div><label>Reason</label><select id="salrev-reason"><option>Annual Increment</option><option>Promotion</option><option>Salary Correction</option><option>Special Revision</option></select></div>
+      </div>
+      <label style="display:block;margin-top:12px;">Remarks</label><input id="salrev-remarks" placeholder="Approval / note">
+      <div id="salrev-preview" style="background:#f8fafc;border-radius:8px;padding:12px;margin-top:14px;font-size:13px;"></div>
+      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;">
+        <button class="btn btn-secondary" onclick="SSIApp.closeModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="SSIPayroll.saveSalaryRevision()">💾 Save Revision & Arrear</button>
+      </div>`);
+  }
+
+  function previewSalaryRevision() {
+    const empSel = document.getElementById('salrev-emp');
+    const oldInput = document.getElementById('salrev-old');
+    const newInput = document.getElementById('salrev-new');
+    if (empSel && oldInput && Number(oldInput.value||0) === 0) {
+      oldInput.value = empSel.selectedOptions[0]?.dataset?.sal || 0;
+    }
+    const oldSal = _money(parseFloat(oldInput?.value)||0);
+    const newSal = _money(parseFloat(newInput?.value)||0);
+    const from = document.getElementById('salrev-from')?.value;
+    const payMonth = document.getElementById('salrev-paymonth')?.value;
+    const months = _monthsBetweenInclusive(from, payMonth).filter(m => m <= payMonth);
+    const diff = Math.max(0, _money(newSal - oldSal));
+    const arrear = _money(diff * months.length);
+    const el = document.getElementById('salrev-preview');
+    if (el) el.innerHTML = `Salary difference: <b>₹${_fmt(diff)}</b> × ${months.length} month(s) = <b style="color:#0369a1;">₹${_fmt(arrear)} arrear</b><br><span style="color:#64748b;">Months: ${months.join(', ') || '—'}</span>`;
+  }
+
+  async function saveSalaryRevision() {
+    if (!SSIApp.hasRole('ADMIN')) { SSIApp.toast('🔒 Admin only'); return; }
+    const st = SSIApp.getState();
+    const empId = document.getElementById('salrev-emp')?.value;
+    const emp = (st.employees||[]).find(e=>e.id===empId);
+    if (!emp) { SSIApp.toast('Select employee'); return; }
+    const oldSal = _money(parseFloat(document.getElementById('salrev-old')?.value)||0);
+    const newSal = _money(parseFloat(document.getElementById('salrev-new')?.value)||0);
+    const from = document.getElementById('salrev-from')?.value;
+    const payMonth = document.getElementById('salrev-paymonth')?.value;
+    if (!from || !payMonth || newSal <= oldSal) { SSIApp.toast('Enter valid salary revision'); return; }
+    const months = _monthsBetweenInclusive(from, payMonth);
+    const arrear = _money((newSal - oldSal) * months.length);
+    if (!st.salary_revisions) st.salary_revisions = [];
+    const sr = { id: SSIApp.uid(), emp_id: empId, emp_name: emp.name||'', old_salary: oldSal, new_salary: newSal, effective_from: from, pay_month: payMonth, arrear_months: months, arrear_amount: arrear, reason: document.getElementById('salrev-reason')?.value||'', remarks: document.getElementById('salrev-remarks')?.value.trim()||'', revised_by: SSIApp.state.currentUser?.username||'', revised_at: new Date().toISOString() };
+    st.salary_revisions.push(sr);
+    emp.monthly_salary = newSal;
+
+    // Add arrear to selected pay month payroll record if present; otherwise keep pending in arrears register.
+    const rec = (st.payroll||[]).find(p=>p.emp_id===empId && p.period===payMonth);
+    if (rec) {
+      rec.arrear_amount = _money((rec.arrear_amount||0) + arrear);
+      rec.gross_pay = _money((rec.gross_pay||0) + arrear);
+      rec.net_pay = Math.max(0, _money((rec.net_pay||0) + arrear));
+      rec.balance_amount = _balanceAmount(rec);
+      rec.updated_at = new Date().toISOString();
+    } else {
+      if (!st.pending_arrears) st.pending_arrears = [];
+      st.pending_arrears.push({ id: SSIApp.uid(), emp_id: empId, pay_month: payMonth, amount: arrear, salary_revision_id: sr.id, created_at: new Date().toISOString() });
+    }
+    await SSIApp.saveState(st);
+    SSIApp.audit('SALARY_REVISION', `Salary revision ${emp.name}: ₹${oldSal} to ₹${newSal}, arrear ₹${arrear}`);
+    SSIApp.closeModal();
+    SSIApp.toast('✅ Salary revision and arrear saved');
+    applyFilter();
+  }
+
+  function openRevisionLog() {
+    const st = SSIApp.getState();
+    const payRevs = st.payroll_revisions || [];
+    const salRevs = st.salary_revisions || [];
+    const rows1 = payRevs.slice().reverse().map(r=>`<tr><td>${_fmtPeriod(r.period)}</td><td>${r.emp_id}</td><td>₹${_fmt(r.old_net_pay)}</td><td>₹${_fmt(r.revised_net_pay)}</td><td>₹${_fmt(r.difference)}</td><td>${r.adjustment_option}</td><td>${r.reason||''}</td><td>${(r.revised_at||'').slice(0,10)}</td></tr>`).join('') || `<tr><td colspan="8" style="text-align:center;color:#94a3b8;padding:20px;">No payroll revisions yet.</td></tr>`;
+    const rows2 = salRevs.slice().reverse().map(r=>`<tr><td>${r.emp_name}</td><td>₹${_fmt(r.old_salary)}</td><td>₹${_fmt(r.new_salary)}</td><td>${r.effective_from}</td><td>${r.pay_month}</td><td>₹${_fmt(r.arrear_amount)}</td><td>${r.reason||''}</td><td>${(r.revised_at||'').slice(0,10)}</td></tr>`).join('') || `<tr><td colspan="8" style="text-align:center;color:#94a3b8;padding:20px;">No salary revisions yet.</td></tr>`;
+    SSIApp.modal(`<h3 style="margin-bottom:14px;">🧾 Payroll / Salary Revision Logs</h3>
+      <h4>Post-payment payroll revisions</h4><div style="overflow:auto;max-height:230px;"><table style="width:100%;border-collapse:collapse;font-size:12px;"><thead><tr><th>Period</th><th>Emp</th><th>Old Net</th><th>Revised Net</th><th>Diff</th><th>Option</th><th>Reason</th><th>Date</th></tr></thead><tbody>${rows1}</tbody></table></div>
+      <h4 style="margin-top:18px;">Salary revision / arrears</h4><div style="overflow:auto;max-height:230px;"><table style="width:100%;border-collapse:collapse;font-size:12px;"><thead><tr><th>Employee</th><th>Old</th><th>New</th><th>Effective</th><th>Paid In</th><th>Arrear</th><th>Reason</th><th>Date</th></tr></thead><tbody>${rows2}</tbody></table></div>
+      <div style="text-align:right;margin-top:16px;"><button class="btn btn-secondary" onclick="SSIApp.closeModal()">Close</button></div>`);
+  }
+
   /* ── Export ──────────────────────────────────────────────── */
   function exportExcel() {
     const st      = SSIApp.getState();
@@ -790,7 +1081,7 @@ const SSIPayroll = (() => {
       return true;
     });
 
-    const headers = ['Period','Emp Code','Name','Type','Unit','Monthly Sal','Days Present','Half Days','Leaves','Paid Leaves','OT Hrs','OT Amt','Deductions','Gross Pay','Net Pay','Status','Payment Mode','Payment Date','Remarks'];
+    const headers = ['Period','Emp Code','Name','Type','Unit','Monthly Sal','Days Present','Half Days','Leaves','Paid Leaves','OT Hrs','OT Amt','Arrear','Deductions','Gross Pay','Net Pay','Paid Amount','Balance','Status','Payment Mode','Payment Date','Remarks'];
     const rows = [headers];
     list.forEach(p => {
       const emp  = _findEmp(st, p);
@@ -798,7 +1089,7 @@ const SSIPayroll = (() => {
       rows.push([
         p.period, emp?.emp_code||p.emp_code||'', emp?.name||p.emp_name||'', emp?.type||p.emp_type||'', unit?.name||p.unit_name||'',
         _money(p.monthly_salary), p.present_days, p.half_days, p.leave_days, (p.payable_days ?? p.paid_leaves),
-        _r2(p.ot_hours), _money(p.ot_amount), _money(p.deductions), _money(p.gross_pay), _money(p.net_pay),
+        _r2(p.ot_hours), _money(p.ot_amount), _money(p.arrear_amount||0), _money(p.deductions), _money(p.gross_pay), _money(p.net_pay), _paidAmount(p), _balanceAmount(p),
         p.status, p.payment_mode||'', p.payment_date||'', p.remarks||''
       ]);
     });
@@ -829,6 +1120,8 @@ const SSIPayroll = (() => {
       DRAFT:     {bg:'#f3f4f6',c:'#6b7280',l:'📝 Draft'},
       PROCESSED: {bg:'#fef3c7',c:'#92400e',l:'🔄 Processed'},
       PAID:      {bg:'#dcfce7',c:'#166534',l:'✅ Paid'},
+      PARTIAL:   {bg:'#fff7ed',c:'#c2410c',l:'💳 Partial'},
+      FROZEN:    {bg:'#eff6ff',c:'#1d4ed8',l:'🔒 Frozen'},
     };
     const v = map[s]||{bg:'#f3f4f6',c:'#6b7280',l:s};
     return `<span style="background:${v.bg};color:${v.c};padding:3px 8px;border-radius:12px;font-size:11px;font-weight:600;">${v.l}</span>`;
@@ -935,7 +1228,8 @@ const SSIPayroll = (() => {
   return {
     render, refresh, applyFilter,
     openGenerateModal, runGenerate,
-    openEdit, saveEdit, _calcNet, openBulkDeduction, saveBulkDeduction, deletePayroll, markPaid,
+    openEdit, saveEdit, _calcNet, openBulkDeduction, saveBulkDeduction, deletePayroll, markPaid, openPayment, savePayment,
+    openRevision, previewRevision, saveRevision, openSalaryRevision, previewSalaryRevision, saveSalaryRevision, openRevisionLog,
     printSlip, exportExcel,
     openRelinkModal, saveRelink
   };

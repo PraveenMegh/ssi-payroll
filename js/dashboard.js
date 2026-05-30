@@ -37,7 +37,10 @@ const SSIDashboard = (() => {
     const gross = list.reduce((s,p)=>s+(Number(p.gross_pay)||0),0);
     const net = list.reduce((s,p)=>s+(Number(p.net_pay)||0),0);
     const otAmt = list.reduce((s,p)=>s+(Number(p.ot_amount)||0),0);
+    const arrears = list.reduce((s,p)=>s+(Number(p.arrear_amount)||0),0);
     const deductions = list.reduce((s,p)=>s+(Number(p.deductions)||0),0);
+    const amountPaid = list.reduce((s,p)=>s+(Number(p.paid_amount ?? (String(p.status||'').toUpperCase()==='PAID' ? p.net_pay : 0))||0),0);
+    const pendingAmount = Math.max(0, net - amountPaid);
     const paid = list.filter(p=>String(p.status||'').toUpperCase()==='PAID').length;
     const draft = list.filter(p=>String(p.status||'').toUpperCase()!=='PAID').length;
 
@@ -101,7 +104,7 @@ const SSIDashboard = (() => {
           <div style="background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.28);border-radius:16px;padding:12px 16px;min-width:190px;text-align:center;">
             <div style="font-size:12px;opacity:.9;">Net Payable</div>
             <div style="font-size:28px;font-weight:900;">${money(net)}</div>
-            <div style="font-size:11px;opacity:.85;">${paid}/${list.length || 0} marked paid</div>
+            <div style="font-size:11px;opacity:.85;">Paid: ${money(amountPaid)} | Pending: ${money(pendingAmount)}</div>
           </div>
         </div>
         <div class="paydash-actions">
@@ -118,7 +121,10 @@ const SSIDashboard = (() => {
         ${card('💵','Gross Pay',money(gross),'Before deductions','#166534','#dcfce7')}
         ${card('✅','Net Payable',money(net),'Final payable amount','#15803d','#dcfce7')}
         ${card('⏱️','OT Amount',money(otAmt),`${Math.round(otHours)} OT hrs`,'#92400e','#ffedd5')}
+        ${card('📈','Arrears',money(arrears),'Increment / revision arrears','#0369a1','#e0f2fe')}
         ${card('➖','Deductions',money(deductions),`${deductionPct}% of gross pay`,'#b91c1c','#fee2e2')}
+        ${card('💳','Amount Paid',money(amountPaid),`${paid}/${list.length || 0} employees paid`,'#166534','#dcfce7')}
+        ${card('⏳','Pending Payment',money(pendingAmount),'Balance payable','#c2410c','#ffedd5')}
       </div>
 
       <div class="paydash-two">
@@ -142,6 +148,8 @@ const SSIDashboard = (() => {
             ${mini('Payroll Records',list.length,'#991b1b')}
             ${mini('Paid',paid,'#166534')}
             ${mini('Pending/Draft',draft,'#92400e')}
+            ${mini('Amount Paid',money(amountPaid),'#166534')}
+            ${mini('Pending ₹',money(pendingAmount),'#c2410c')}
             ${mini('Avg Net Pay',money(avgNet),'#0369a1')}
           </div>
         </div>
@@ -198,12 +206,14 @@ const SSIDashboard = (() => {
     if (!rows.length) return `<div class="empty-state" style="padding:26px;"><div class="icon">📭</div><p>No payroll generated for this month yet.</p></div>`;
     return `<div style="overflow:auto;">
       <table class="paydash-table">
-        <thead><tr><th>Employee</th><th>Gross</th><th>Deductions</th><th>Net</th><th>Status</th></tr></thead>
+        <thead><tr><th>Employee</th><th>Gross</th><th>Deductions</th><th>Net</th><th>Paid</th><th>Balance</th><th>Status</th></tr></thead>
         <tbody>${rows.map(r => `<tr>
           <td><b>${r.emp_name || r.employee_name || r.emp_id || '-'}</b><br><span style="font-size:11px;color:#94a3b8;">${r.emp_id || ''}</span></td>
           <td>${money(r.gross_pay)}</td>
           <td>${money(r.deductions)}</td>
           <td><b>${money(r.net_pay)}</b></td>
+          <td>${money(r.paid_amount ?? (String(r.status||'').toUpperCase()==='PAID'?r.net_pay:0))}</td>
+          <td>${money(Math.max(0,(Number(r.net_pay)||0)-(Number(r.paid_amount ?? (String(r.status||'').toUpperCase()==='PAID'?r.net_pay:0))||0)))}</td>
           <td><span class="paydash-pill ${String(r.status||'').toUpperCase()==='PAID'?'ok':''}">${r.status || 'DRAFT'}</span></td>
         </tr>`).join('')}</tbody>
       </table>

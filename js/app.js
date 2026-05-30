@@ -24,7 +24,7 @@ const SSIApp = {
   state: {
     users: [], products: [], clients: [],
     orders: [], inventory: [], units: [],
-    employees: [], attendance: [], payroll: [],
+    employees: [], attendance: [], payroll: [], payment_history: [], payroll_revisions: [], salary_revisions: [], pending_arrears: [], next_month_adjustments: [],
     currentUser: null, lastSaved: null
   },
 
