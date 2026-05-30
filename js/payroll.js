@@ -158,6 +158,8 @@ const SSIPayroll = (() => {
       <div class="page-header">
         <h2 class="page-title">💰 Payroll</h2>
         <div style="display:flex;gap:10px;flex-wrap:wrap;">
+          <button class="btn btn-secondary btn-sm" onclick="SSIApp.navigate('attendance')">🗓️ Attendance Panel</button>
+          <button class="btn btn-secondary btn-sm" onclick="SSIPayroll.openBulkDeduction()">➖ Deduction Panel</button>
           <button class="btn btn-secondary btn-sm" onclick="SSIPayroll.exportExcel()">📤 Export</button>
           <button class="btn btn-primary" onclick="SSIPayroll.openGenerateModal()">⚙️ Generate Payroll</button>
         </div>
@@ -215,7 +217,7 @@ const SSIPayroll = (() => {
             <th style="text-align:center;">Days P</th>
             <th style="text-align:center;">H</th>
             <th style="text-align:center;">L</th>
-            <th style="text-align:center;">Paid L</th>
+            <th style="text-align:center;">Pay Days</th>
             <th style="text-align:right;">OT Hrs</th>
             <th style="text-align:right;">OT Amt</th>
             <th style="text-align:right;">Deduct.</th>
@@ -313,7 +315,7 @@ const SSIPayroll = (() => {
         <td style="text-align:center;">${p.present_days}</td>
         <td style="text-align:center;">${p.half_days}</td>
         <td style="text-align:center;">${p.leave_days}</td>
-        <td style="text-align:center;color:#3730a3;font-weight:600;">${p.paid_leaves}</td>
+        <td style="text-align:center;color:#3730a3;font-weight:600;">${_fmtQty(p.payable_days ?? (p.present_days + (p.half_days||0)*0.5 + (p.paid_leaves||0)))}</td>
         <td style="text-align:right;">${_fmt(otHrs)}</td>
         <td style="text-align:right;color:#f59e0b;font-weight:600;">${otAmt>0?'₹'+_fmt(otAmt):'—'}</td>
         <td style="text-align:right;color:#991b1b;">${deduct>0?'₹'+_fmt(deduct):'—'}</td>
@@ -364,12 +366,11 @@ const SSIPayroll = (() => {
       </div>
       <div style="background:#fef3c7;border-radius:8px;padding:12px;font-size:13px;margin-bottom:16px;">
         <b>ℹ️ Rules applied:</b><br>
-        • Per day salary = Monthly ÷ 30 days<br>
-        • OT rate = (Monthly Salary ÷ 30 ÷ 8) per hour — auto-calculated<br>
-        • Staff: up to ${PAID_LEAVES_STAFF} leaves/month counted as Present<br>
-        • Workers: overtime eligible (Staff: no OT)<br>
-        • EPF = 12% of basic earnings (employer), ESI = 0.75% if Gross ≤ ₹21,000<br>
-        • Half day = 0.5 day pay<br>
+        • Salary is divided by 30 days and Sundays are included for monthly salary<br>
+        • If all Monday–Saturday working days are present, full monthly salary is payable<br>
+        • Short hours/absence reduce salary proportionately from the 30-day base<br>
+        • OT rate = Monthly Salary ÷ 30 ÷ 8 per hour<br>
+        • Amounts are rounded to whole rupees<br>
         • Existing payroll for same employee+month will be <b>overwritten</b> (if not PAID)
       </div>
       <div style="display:flex;gap:10px;justify-content:flex-end;">
@@ -402,6 +403,8 @@ const SSIPayroll = (() => {
       const d = String(i+1).padStart(2,'0');
       return `${yr}-${String(mo).padStart(2,'0')}-${d}`;
     });
+    // Monday to Saturday are working days. Sundays are included in salary by default.
+    const scheduledWorkingDays = days.filter(d => new Date(d + 'T00:00:00').getDay() !== 0).length;
 
     const attRecs = (st.attendance||[]).filter(a=>a.date&&a.date.startsWith(month) && a.active !== false);
     const attMap  = {};
@@ -439,20 +442,26 @@ const SSIPayroll = (() => {
 
       const paidLeaves = emp.type==='STAFF' ? Math.min(leaves, PAID_LEAVES_STAFF) : 0;
 
-      const effectiveDays = _r2(paidAttendanceDays + paidLeaves);
+      // Salary rule: Monthly salary is divided by 30 days and Sundays are included.
+      // If an employee is present for all Mon–Sat working days, full 30 days are paid.
+      // Short hours / absences reduce payable days from the 30-day base.
+      const payableWorkEquivalent = _r2(paidAttendanceDays + paidLeaves);
+      const lossOfPayDays = Math.max(0, _r2(scheduledWorkingDays - payableWorkEquivalent));
+      const effectiveDays = payableWorkEquivalent <= 0 ? 0 : Math.max(0, Math.min(30, _r2(30 - lossOfPayDays)));
       const perDay        = _r2((emp.monthly_salary||0) / 30);
       const otRate        = _r2((emp.monthly_salary||0) / 30 / 8);
-      const grossBase     = _r2(perDay * effectiveDays);
-      const otAmount      = emp.type==='WORKER' ? _r2(otHours * otRate) : 0;
-      const grossPay      = _r2(grossBase + otAmount);
+      const grossBase     = _money(perDay * effectiveDays);
+      const otAmount      = _money(otHours * otRate);
+      const grossPay      = _money(grossBase + otAmount);
 
       const existing      = st.payroll.find(p=>p.emp_id===emp.id&&p.period===month);
-      const advance       = _r2(existing?.advance || 0);
-      const epfAmount     = _r2(grossBase * EPF_RATE);
-      const esiAmount     = grossPay <= ESI_LIMIT ? _r2(grossPay * ESI_RATE) : 0;
-      const totalDeduct   = _r2(advance + epfAmount + esiAmount);
+      const advance       = _money(existing?.advance || 0);
+      const otherDeduct   = _money(existing?.other_deduction || 0);
+      const epfAmount     = _money(grossBase * EPF_RATE);
+      const esiAmount     = grossPay <= ESI_LIMIT ? _money(grossPay * ESI_RATE) : 0;
+      const totalDeduct   = _money(advance + otherDeduct + epfAmount + esiAmount);
       const deductions    = totalDeduct;
-      const netPay        = Math.max(0, _r2(grossPay - totalDeduct));
+      const netPay        = Math.max(0, _money(grossPay - totalDeduct));
 
       const rec = {
         id:             existing?.id || SSIApp.uid(),
@@ -464,6 +473,9 @@ const SSIPayroll = (() => {
         period:         month,
         monthly_salary: _r2(emp.monthly_salary||0),
         working_days:   30,
+        scheduled_working_days: scheduledWorkingDays,
+        payable_days:   effectiveDays,
+        loss_of_pay_days: lossOfPayDays,
         present_days:   present,
         half_days:      half,
         leave_days:     leaves,
@@ -476,6 +488,7 @@ const SSIPayroll = (() => {
         ot_amount:      otAmount,
         gross_pay:      grossPay,
         advance:        advance,
+        other_deduction: otherDeduct,
         epf_amount:     epfAmount,
         esi_amount:     esiAmount,
         deductions:     totalDeduct,
@@ -527,19 +540,23 @@ const SSIPayroll = (() => {
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
         <div>
           <label>💰 Advance / Loan Recovery (₹)</label>
-          <input type="number" id="edit-advance" value="${_r2(rec.advance||0)}" min="0" step="0.01" oninput="SSIPayroll._calcNet()">
+          <input type="number" id="edit-advance" value="${_money(rec.advance||0)}" min="0" step="1" oninput="SSIPayroll._calcNet()">
         </div>
         <div>
           <label>📌 EPF (12% of Basic) <span style="font-size:10px;color:#64748b;">auto</span></label>
-          <input type="number" id="edit-epf" value="${_r2(rec.epf_amount||0)}" min="0" step="0.01" oninput="SSIPayroll._calcNet()">
+          <input type="number" id="edit-epf" value="${_money(rec.epf_amount||0)}" min="0" step="1" oninput="SSIPayroll._calcNet()">
         </div>
         <div>
           <label>🏥 ESI (0.75% if ≤₹21K) <span style="font-size:10px;color:#64748b;">auto</span></label>
-          <input type="number" id="edit-esi" value="${_r2(rec.esi_amount||0)}" min="0" step="0.01" oninput="SSIPayroll._calcNet()">
+          <input type="number" id="edit-esi" value="${_money(rec.esi_amount||0)}" min="0" step="1" oninput="SSIPayroll._calcNet()">
+        </div>
+        <div>
+          <label>➖ Other Deduction (₹)</label>
+          <input type="number" id="edit-other-deduction" value="${_money(rec.other_deduction||0)}" min="0" step="1" oninput="SSIPayroll._calcNet()">
         </div>
         <div>
           <label>📝 Deduction Note</label>
-          <input id="edit-deduct-note" value="${rec.deduction_note||''}" placeholder="e.g. Advance recovery">
+          <input id="edit-deduct-note" value="${rec.deduction_note||''}" placeholder="e.g. Advance recovery / penalty / other deduction">
         </div>
         <div>
           <label>Payment Mode</label>
@@ -566,11 +583,12 @@ const SSIPayroll = (() => {
   }
 
   function _calcNet() {
-    const adv = _r2(parseFloat(document.getElementById('edit-advance')?.value)||0);
-    const epf = _r2(parseFloat(document.getElementById('edit-epf')?.value)||0);
-    const esi = _r2(parseFloat(document.getElementById('edit-esi')?.value)||0);
-    const gross = _r2(parseFloat(document.getElementById('edit-net-preview')?.dataset?.gross || 0));
-    const n = Math.max(0, _r2(gross - adv - epf - esi));
+    const adv = _money(parseFloat(document.getElementById('edit-advance')?.value)||0);
+    const epf = _money(parseFloat(document.getElementById('edit-epf')?.value)||0);
+    const esi = _money(parseFloat(document.getElementById('edit-esi')?.value)||0);
+    const oth = _money(parseFloat(document.getElementById('edit-other-deduction')?.value)||0);
+    const gross = _money(parseFloat(document.getElementById('edit-net-preview')?.dataset?.gross || 0));
+    const n = Math.max(0, _money(gross - adv - epf - esi - oth));
     const el = document.getElementById('edit-net-preview');
     if (el) { el.textContent = '₹' + _fmt(n); }
   }
@@ -580,15 +598,17 @@ const SSIPayroll = (() => {
     const idx = (st.payroll||[]).findIndex(p=>p.id===recId);
     if (idx<0) return;
     const rec     = st.payroll[idx];
-    const advance = Math.max(0, _r2(parseFloat(document.getElementById('edit-advance')?.value)||0));
-    const epf     = Math.max(0, _r2(parseFloat(document.getElementById('edit-epf')?.value)||0));
-    const esi     = Math.max(0, _r2(parseFloat(document.getElementById('edit-esi')?.value)||0));
-    const totalD  = _r2(advance + epf + esi);
-    const netPay  = Math.max(0, _r2(rec.gross_pay - totalD));
+    const advance = Math.max(0, _money(parseFloat(document.getElementById('edit-advance')?.value)||0));
+    const epf     = Math.max(0, _money(parseFloat(document.getElementById('edit-epf')?.value)||0));
+    const esi     = Math.max(0, _money(parseFloat(document.getElementById('edit-esi')?.value)||0));
+    const other   = Math.max(0, _money(parseFloat(document.getElementById('edit-other-deduction')?.value)||0));
+    const totalD  = _money(advance + epf + esi + other);
+    const netPay  = Math.max(0, _money(rec.gross_pay - totalD));
 
     st.payroll[idx] = {
       ...rec,
       advance,
+      other_deduction: other,
       epf_amount:     epf,
       esi_amount:     esi,
       deductions:     totalD,
@@ -698,6 +718,66 @@ const SSIPayroll = (() => {
     applyFilter();
   }
 
+
+  /* ── Bulk Deduction Panel ───────────────────────────────── */
+  function openBulkDeduction() {
+    if (!SSIApp.hasRole('ADMIN','ACCOUNTS','ACCOUNTANT')) return;
+    const st = SSIApp.getState();
+    const periods = [...new Set((st.payroll||[]).map(p=>p.period).filter(Boolean))].sort().reverse();
+    const period = document.getElementById('pr-filter-period')?.value || periods[0] || '';
+    const list = (st.payroll||[]).filter(p => !period || p.period === period);
+
+    SSIApp.modal(`
+      <h3 style="margin-bottom:14px;">➖ Deduction Panel</h3>
+      <div style="background:#fef3c7;border-radius:8px;padding:10px;margin-bottom:12px;font-size:13px;color:#92400e;">
+        Add/update deduction without deleting payroll history. Paid records are skipped.
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">
+        <div><label>Payroll Month</label><select id="bulk-ded-period">${periods.map(p=>`<option value="${p}" ${p===period?'selected':''}>${_fmtPeriod(p)}</option>`).join('')}</select></div>
+        <div><label>Deduction Type</label><select id="bulk-ded-type"><option value="advance">Advance / Loan</option><option value="other_deduction">Other Deduction</option></select></div>
+        <div><label>Amount ₹</label><input id="bulk-ded-amount" type="number" step="1" min="0" value="0"></div>
+        <div><label>Employee</label><select id="bulk-ded-emp"><option value="">All unpaid records in month</option>${list.map(p=>`<option value="${p.id}">${p.emp_name||p.emp_code||p.emp_id}</option>`).join('')}</select></div>
+      </div>
+      <label>Deduction Note</label><input id="bulk-ded-note" placeholder="Reason for deduction" style="margin-bottom:14px;">
+      <div style="display:flex;gap:10px;justify-content:flex-end;">
+        <button class="btn btn-secondary" onclick="SSIApp.closeModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="SSIPayroll.saveBulkDeduction()">💾 Apply Deduction</button>
+      </div>
+    `);
+  }
+
+  async function saveBulkDeduction() {
+    const st = SSIApp.getState();
+    const period = document.getElementById('bulk-ded-period')?.value || '';
+    const type = document.getElementById('bulk-ded-type')?.value || 'other_deduction';
+    const amount = Math.max(0, _money(parseFloat(document.getElementById('bulk-ded-amount')?.value)||0));
+    const recId = document.getElementById('bulk-ded-emp')?.value || '';
+    const note = document.getElementById('bulk-ded-note')?.value.trim() || '';
+    if (!period) { SSIApp.toast('Select payroll month'); return; }
+    if (amount <= 0) { SSIApp.toast('Enter deduction amount'); return; }
+
+    let changed = 0;
+    (st.payroll||[]).forEach(p => {
+      if (p.status === 'PAID') return;
+      if (recId && p.id !== recId) return;
+      if (!recId && p.period !== period) return;
+      p[type] = _money(amount);
+      p.deduction_note = note || p.deduction_note || '';
+      const totalD = _money((p.advance||0) + (p.other_deduction||0) + (p.epf_amount||0) + (p.esi_amount||0));
+      p.deductions = totalD;
+      p.net_pay = Math.max(0, _money((p.gross_pay||0) - totalD));
+      p.status = p.status === 'DRAFT' ? 'PROCESSED' : p.status;
+      p.updated_at = new Date().toISOString();
+      changed++;
+    });
+    if (!changed) { SSIApp.toast('No unpaid payroll records matched'); return; }
+    await SSIApp.saveState(st);
+    SSIApp.audit('PAYROLL_DEDUCTION', `Applied deduction to ${changed} records for ${period}`);
+    SSIApp.closeModal();
+    SSIApp.toast(`✅ Deduction applied to ${changed} payroll record(s)`);
+    applyFilter();
+  }
+
   /* ── Export ──────────────────────────────────────────────── */
   function exportExcel() {
     const st      = SSIApp.getState();
@@ -717,8 +797,8 @@ const SSIPayroll = (() => {
       const unit = (st.units||[]).find(u=>u.id===emp?.unit_id);
       rows.push([
         p.period, emp?.emp_code||p.emp_code||'', emp?.name||p.emp_name||'', emp?.type||p.emp_type||'', unit?.name||p.unit_name||'',
-        _r2(p.monthly_salary), p.present_days, p.half_days, p.leave_days, p.paid_leaves,
-        _r2(p.ot_hours), _r2(p.ot_amount), _r2(p.deductions), _r2(p.gross_pay), _r2(p.net_pay),
+        _money(p.monthly_salary), p.present_days, p.half_days, p.leave_days, (p.payable_days ?? p.paid_leaves),
+        _r2(p.ot_hours), _money(p.ot_amount), _money(p.deductions), _money(p.gross_pay), _money(p.net_pay),
         p.status, p.payment_mode||'', p.payment_date||'', p.remarks||''
       ]);
     });
@@ -726,10 +806,17 @@ const SSIPayroll = (() => {
   }
 
   /* ── Helpers ─────────────────────────────────────────────── */
+  function _money(n) {
+    return Math.round(Number(n) || 0);
+  }
   function _fmt(n) {
-    // Round to 2 decimals first, then format with Indian thousand separators
-    const rounded = _r2(n);
-    return rounded.toLocaleString('en-IN', {minimumFractionDigits:0, maximumFractionDigits:2});
+    // Whole rupees only for payroll display
+    const rounded = _money(n);
+    return rounded.toLocaleString('en-IN', {minimumFractionDigits:0, maximumFractionDigits:0});
+  }
+  function _fmtQty(n) {
+    const v = _r2(n);
+    return Number.isInteger(v) ? String(v) : v.toFixed(2).replace(/0+$/,'').replace(/\.$/,'');
   }
   function _fmtPeriod(ym) {
     if (!ym) return '';
@@ -848,7 +935,7 @@ const SSIPayroll = (() => {
   return {
     render, refresh, applyFilter,
     openGenerateModal, runGenerate,
-    openEdit, saveEdit, _calcNet, deletePayroll, markPaid,
+    openEdit, saveEdit, _calcNet, openBulkDeduction, saveBulkDeduction, deletePayroll, markPaid,
     printSlip, exportExcel,
     openRelinkModal, saveRelink
   };

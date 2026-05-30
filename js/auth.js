@@ -13,22 +13,18 @@ const SSIAuth = (() => {
       { page: 'attendance', icon: '🗓️', label: 'Attendance'        },
       { page: 'payroll',    icon: '💰', label: 'Payroll'           },
     ],
-    ACCOUNTANT: [
-      { page: 'dashboard',  icon: '📊', label: 'Payroll Dashboard' },
-      { page: 'employees',  icon: '👥', label: 'Employees'  },
-      { page: 'attendance', icon: '🗓️', label: 'Attendance' },
-      { page: 'payroll',    icon: '💰', label: 'Payroll'    },
-    ],
     ACCOUNTS: [
       { page: 'dashboard',  icon: '📊', label: 'Payroll Dashboard' },
       { page: 'employees',  icon: '👥', label: 'Employees'         },
       { page: 'attendance', icon: '🗓️', label: 'Attendance'        },
       { page: 'payroll',    icon: '💰', label: 'Payroll'           },
     ],
-    // Non-payroll roles can still login, but only see dashboard.
-    STOCK:    [{ page: 'dashboard', icon: '📊', label: 'Payroll Dashboard' }],
-    DISPATCH: [{ page: 'dashboard', icon: '📊', label: 'Payroll Dashboard' }],
-    SALES:    [{ page: 'dashboard', icon: '📊', label: 'Payroll Dashboard' }]
+    ACCOUNTANT: [
+      { page: 'dashboard',  icon: '📊', label: 'Payroll Dashboard' },
+      { page: 'employees',  icon: '👥', label: 'Employees'         },
+      { page: 'attendance', icon: '🗓️', label: 'Attendance'        },
+      { page: 'payroll',    icon: '💰', label: 'Payroll'           },
+    ]
   };
 
   function showLogin(errorMsg) {
@@ -55,7 +51,7 @@ const SSIAuth = (() => {
 
     const navEl = document.getElementById('sidebar-nav');
     if (navEl) {
-      const items = NAV_ITEMS[user.role] || NAV_ITEMS.SALES;
+      const items = NAV_ITEMS[user.role] || [];
       navEl.innerHTML = items.map(item => `
         <button data-nav="${item.page}"
           onclick="SSIApp.navigate('${item.page}')"
@@ -77,9 +73,7 @@ const SSIAuth = (() => {
     if (topRole) topRole.textContent = user.role;
 
     const defaultPage = {
-      ADMIN:'payroll',  STOCK:'dashboard',
-      DISPATCH:'dashboard', SALES:'dashboard',
-      ACCOUNTANT:'payroll', ACCOUNTS:'payroll'
+      ADMIN:'payroll', ACCOUNTANT:'payroll', ACCOUNTS:'payroll'
     };
     SSIApp.navigate(defaultPage[user.role] || 'dashboard');
   }

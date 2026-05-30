@@ -6,7 +6,7 @@
 
 const SSIUsers = (() => {
 
-  const ROLES = ['ADMIN', 'STOCK', 'DISPATCH', 'SALES', 'ACCOUNTANT', 'ACCOUNTS'];
+  const ROLES = ['ADMIN', 'ACCOUNTS'];
 
   const ROLE_COLORS = {
     ADMIN:      { bg:'#fef3c7', color:'#92400e' },
@@ -70,7 +70,7 @@ const SSIUsers = (() => {
   function renderRows() {
     const st = SSIApp.getState();
     const showInactive = document.getElementById('usr-show-inactive')?.checked;
-    let users = st.users || [];
+    let users = (st.users || []).filter(u => ['ADMIN','ACCOUNTS'].includes(u.role) || ['admin','accounts'].includes((u.username||'').toLowerCase()));
     if (!showInactive) users = users.filter(u => u.active !== false);
     if (!users.length) return `<tr><td colspan="5" style="text-align:center;padding:40px;color:#94a3b8;">No users found.</td></tr>`;
 
@@ -118,7 +118,7 @@ const SSIUsers = (() => {
           <input id="usr-password" type="text" value="" style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:6px;"></label>
         <label style="display:block;margin-bottom:12px;">Role<br>
           <select id="usr-role" style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:6px;">
-            ${ROLES.map(r => `<option value="${r}" ${(user?.role || 'SALES') === r ? 'selected' : ''}>${r}</option>`).join('')}
+            ${ROLES.map(r => `<option value="${r}" ${(user?.role || 'ACCOUNTS') === r ? 'selected' : ''}>${r}</option>`).join('')}
           </select></label>
         <label style="display:flex;align-items:center;gap:6px;margin-bottom:16px;">
           <input id="usr-active" type="checkbox" ${user?.active !== false ? 'checked' : ''}/> Active
@@ -139,7 +139,7 @@ const SSIUsers = (() => {
     const name     = (document.getElementById('usr-name')?.value     || '').trim();
     const username = (document.getElementById('usr-username')?.value || '').trim().toLowerCase();
     const password = (document.getElementById('usr-password')?.value || '').trim();
-    const role     = document.getElementById('usr-role')?.value || 'SALES';
+    const role     = document.getElementById('usr-role')?.value || 'ACCOUNTS';
     const active   = document.getElementById('usr-active')?.checked !== false;
     const errEl    = document.getElementById('usr-err');
 

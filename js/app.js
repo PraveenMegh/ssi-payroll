@@ -16,17 +16,8 @@ const SSIApp = {
 
   // ── Default users (always guaranteed) ─────────────────────
   _DEFAULT_USERS: [
-    { id:'u1',  username:'admin',    password:'admin123',    name:'Administrator',       role:'ADMIN',    active:true },
-    { id:'u2',  username:'stock1',   password:'stock123',    name:'Kajal V',             role:'STOCK',    active:true },
-    { id:'u3',  username:'dispatch1',password:'dispatch123', name:'Amit Jawla',          role:'DISPATCH', active:true },
-    { id:'u4',  username:'vipin',    password:'vipin123',    name:'Vipin Dabas',         role:'SALES',    active:true },
-    { id:'u5',  username:'manish',   password:'manish123',   name:'Manish Srivastava',   role:'SALES',    active:true },
-    { id:'u6',  username:'vishal',   password:'vishal123',   name:'Vishal Sharma',       role:'SALES',    active:true },
-    { id:'u7',  username:'madhu',    password:'madhu123',    name:'Madhu Sharma',        role:'SALES',    active:true },
-    { id:'u8',  username:'raja',     password:'raja123',     name:'Raja',                role:'SALES',    active:true },
-    { id:'u9',  username:'mittal',   password:'mittal123',   name:'Mittal Delhi Team',   role:'SALES',    active:true },
-    { id:'u10', username:'praveen',  password:'praveen123',  name:'Praveen Sharma',      role:'SALES',    active:true },
-    { id:'u11', username:'accounts',   password:'accounts123', name:'Accounts',             role:'ACCOUNTS', active:true }
+    { id:'u1',  username:'admin',    password:'admin123',    name:'Administrator', role:'ADMIN',    active:true },
+    { id:'u11', username:'accounts', password:'accounts123', name:'Accounts',      role:'ACCOUNTS', active:true }
   ],
 
   // ── State ──────────────────────────────────────────────────
@@ -104,21 +95,30 @@ const SSIApp = {
     if (!this.state.users) this.state.users = [];
     let changed = false;
 
-    if (this.state.users.length === 0) {
-      this.state.users = [...this._DEFAULT_USERS];
-      return true;
-    }
+    // Payroll-only system: keep only Admin and Accounts active.
+    // Do NOT delete old users, because old audit/payroll history may refer to them.
+    const required = this._DEFAULT_USERS;
 
-    // Deduplicate users by id (safety net against double-save bug)
-    if (this._dedupUsers()) changed = true;
-
-    // Ensure every default user exists (add if missing)
-    for (const du of this._DEFAULT_USERS) {
-      if (!this.state.users.find(u => u.username === du.username)) {
+    for (const du of required) {
+      let u = this.state.users.find(x => x.username === du.username);
+      if (!u) {
         this.state.users.push({ ...du });
         changed = true;
+      } else {
+        if (u.role !== du.role) { u.role = du.role; changed = true; }
+        if (u.active === false) { u.active = true; changed = true; }
       }
     }
+
+    // Disable legacy sales/stock/dispatch users in payroll-only app.
+    // They remain stored for old references/backups, but cannot login.
+    this.state.users.forEach(u => {
+      if (!['admin','accounts'].includes((u.username||'').toLowerCase())) {
+        if (u.active !== false) { u.active = false; changed = true; }
+      }
+    });
+
+    if (this._dedupUsers()) changed = true;
     return changed;
   },
 
@@ -200,11 +200,8 @@ const SSIApp = {
 
     const allowed = {
       ADMIN:       ['dashboard','users','employees','attendance','payroll'],
-      STOCK:       ['dashboard'],
-      DISPATCH:    ['dashboard'],
-      SALES:       ['dashboard'],
-      ACCOUNTANT:  ['dashboard','employees','attendance','payroll'],
-      ACCOUNTS:    ['dashboard','employees','attendance','payroll']
+      ACCOUNTS:    ['dashboard','employees','attendance','payroll'],
+      ACCOUNTANT:  ['dashboard','employees','attendance','payroll']
     };
 
     if (!(allowed[u.role] || []).includes(page)) {
